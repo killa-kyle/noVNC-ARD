@@ -190,6 +190,9 @@ export class HpSession {
         }
         ws.binaryType = 'arraybuffer';
         this._ws = ws;
+        this._log('media transport ' + (this._mediaChannel
+            ? 'DataChannel(adopted) readyState=' + this._mediaChannel.readyState
+            : 'WebSocket ' + this._mediaUrl));
         const onOpen = () => {
             // A plain TCP proxy accepts any path and would hand us the
             // server's RFB greeting here. Only a relay's media endpoint
@@ -586,6 +589,7 @@ export class HpSession {
     // ----- media in -----
 
     _onMedia(data) {
+        if (!this._loggedRecv) { this._loggedRecv = true; this._log('HP first media RECV bytes=' + (data.byteLength || data.length)); }
         if (this.state === 'failed' || this.state === 'closed') return;
         if (!this._ctx) {
             // The server may start before our keys are ready.
@@ -671,6 +675,7 @@ export class HpSession {
             const msg = new Uint8Array(packet.length + 1);
             msg[0] = channel;
             msg.set(packet, 1);
+            if (this.stats.sent === 0) this._log('HP first media SENT ch=' + channel + ' bytes=' + msg.length);
             this._ws.send(msg);
             this.stats.sent++;
         }).catch(() => {});
