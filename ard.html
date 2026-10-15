@@ -570,7 +570,17 @@
                     resolve(ok);
                 };
                 try {
-                    ws = new WebSocket(url + '?probe', MEDIA_SUBPROTOCOL);
+                    // Append `probe` as a query param, not blindly with '?'.
+                    // M1's server endpoint is path-based (/ws/vnc-media/<id>),
+                    // so the media URL carries no query and '?probe' was fine.
+                    // M2's webrtc-ra endpoint is query-based
+                    // (…/ws/vnc-media?token=…&sessionId=…), so a second '?'
+                    // glued '?probe' onto the sessionId value — the agent then
+                    // looked up a sessionId that did not exist and answered 503,
+                    // greying HP out as "no media channel" on every webrtc-local
+                    // connect. Use '&' when the URL already has a query.
+                    const sep = url.includes('?') ? '&' : '?';
+                    ws = new WebSocket(url + sep + 'probe', MEDIA_SUBPROTOCOL);
                 } catch (e) {
                     finish(false);
                     return;
