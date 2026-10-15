@@ -92,6 +92,8 @@ export class HpSession {
     /*
      * mediaUrl:        WebSocket URL of the relay's media endpoint
      * sendOffer(bytes): send the 0x1c message on the RFB connection
+     * mediaChannel:    optional already-created WebSocket-shaped channel (a DataChannel
+     *                  facade) adopted instead of opening mediaUrl
      * holdOffer:       true if the RFB connection is still to be encrypted. The offer
      *                  carries the media keys, so it waits for releaseOffer().
      * createSink({ width, height, stripes, onFirstFrame, onError }): → { push(picture), close() }
@@ -102,9 +104,10 @@ export class HpSession {
      * feedback:        { reports, acks, rateControl } — which RTCP to send
      * endpoint:        how the viewer describes itself in the offer
      */
-    constructor({ mediaUrl, sendOffer, holdOffer, createSink, createAudio, audioMuted, onState,
+    constructor({ mediaUrl, mediaChannel, sendOffer, holdOffer, createSink, createAudio, audioMuted, onState,
                   onResize, feedback, endpoint, WebSocketImpl, now, log, warn }) {
         this._mediaUrl = mediaUrl;
+        this._mediaChannel = mediaChannel || null;
         this._sendOffer = sendOffer;
         this._offerHeld = !!holdOffer;
         this._createSink = createSink;
@@ -175,18 +178,23 @@ export class HpSession {
     start() {
         if (this.state !== 'idle' || this._ws) return;
         let ws;
-        try {
-            ws = new this._WebSocket(this._mediaUrl, MEDIA_SUBPROTOCOL);
-        } catch (e) {
-            this._fail('media-connect', e.message);
-            return;
+        if (this._mediaChannel) {
+            ws = this._mediaChannel;          // adopt an already-open channel (DC facade)
+        } else {
+            try {
+                ws = new this._WebSocket(this._mediaUrl, MEDIA_SUBPROTOCOL);
+            } catch (e) {
+                this._fail('media-connect', e.message);
+                return;
+            }
         }
         ws.binaryType = 'arraybuffer';
         this._ws = ws;
-        ws.onopen = () => {
+        const onOpen = () => {
             // A plain TCP proxy accepts any path and would hand us the
             // server's RFB greeting here. Only a relay's media endpoint
-            // agrees to the subprotocol.
+            // agrees to the subprotocol; a DataChannel facade reports its
+            // label ('ard-media') as protocol.
             if (ws.protocol !== MEDIA_SUBPROTOCOL) {
                 this._fail('media-connect', 'not a media channel');
                 return;
@@ -203,6 +211,10 @@ export class HpSession {
             }
         };
         ws.onerror = () => {};   // a close event follows
+        // An adopted DataChannel may already be open; it will fire no onopen.
+        const alreadyOpen = ws.readyState === 'open' || ws.readyState === 1;
+        ws.onopen = onOpen;
+        if (alreadyOpen) queueMicrotask(onOpen);
         this._timeout(MEDIA_CONNECT_MS, () => {
             if (!this._wsOpen) this._fail('media-connect', 'timeout');
         });

@@ -1571,7 +1571,7 @@ RFB.prototype._handleRect = function () {
 // to ask.
 RFB.prototype._ardHpWanted = function () {
     return this._ardQualityPreset === 'highperf' &&
-           !!this._ardHpAllowed && !!this._ardHpMediaUrl && !this._ardHpFailed &&
+           !!this._ardHpAllowed && (!!this._ardHpMediaUrl || !!this._ardHpMediaChannel) && !this._ardHpFailed &&
            this._ardHpOffered();
 };
 
@@ -1679,6 +1679,7 @@ RFB.prototype._ardHpStart = function () {
     }
     this._ardHp = new HpSession({
         mediaUrl: this._ardHpMediaUrl,
+        mediaChannel: this._ardHpMediaChannel,
         holdOffer,
         feedback: this._ardHpFeedback,
         endpoint: this._ardHpEndpoint,
