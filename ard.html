@@ -188,6 +188,7 @@
         // and a relay with a media endpoint. When it fails, the next
         // connection is an ordinary 'adaptive' one.
         const ardMediaPath = (getParamCI('ardMediaPath') || 'media').replace(/^\/+/, '');
+        const ardMediaUrl = getParamCI('ardMediaUrl');
         // ardHpFeedback: which RTCP the viewer sends, for testing what the
         // server needs. Comma list of rr, ack, rctl; default all.
         const ardHpFeedbackParam = getParamCI('ardHpFeedback');
@@ -356,7 +357,7 @@
         });
 
         function ardHpMediaUrl() {
-            if (UI.getSetting('path') === 'msgport') return null;   // no media channel there yet
+            if (UI.getSetting('path') === 'msgport') return ardMediaUrl || null;
             const host = UI.getSetting('host') || window.location.hostname;
             const port = UI.getSetting('port') || window.location.port;
             const scheme = UI.getSetting('encrypt') ? 'wss' : 'ws';
