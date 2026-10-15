@@ -881,6 +881,9 @@ describe('relay', () => {
                 ['--listen', '6088', '--target', '127.0.0.1', '--bogus', '1'],
                 ['--listen', '6088', '--target'],
                 ['--listen', '6088', '--target', '127.0.0.1', '--allow-origin', 'viewer.example'],
+                ['--listen', '6088', '--target', '127.0.0.1', '--udp-local', 'abc,5901'],
+                ['--listen', '6088', '--target', '127.0.0.1', '--udp-local', '5900'],
+                ['--listen', '6088', '--target', '127.0.0.1', '--bind-source'],
             ];
             for (const args of cases) {
                 const run = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', timeout: 10000 });

@@ -35,14 +35,16 @@ const USAGE = `usage: node relay/relay.mjs --listen PORT --target HOST[:PORT] [-
   --web DIR             directory of static files to serve (default: the repository root)
   --host ADDRESS        address to listen on (default 127.0.0.1)
   --udp-local P1,P2     local UDP source ports per channel (default: same as target 5900,5901)
-  --bind-source ADDR    local source address for TCP connect and UDP sockets (default: 0.0.0.0)
+  --bind-source ADDR    local source address for TCP connect and UDP sockets (default: 0.0.0.0);
+                        when set, media from 127.* is also accepted, for a loopback test
   --allow-origin ORIGIN another web origin whose pages may connect, for example
                         https://viewer.example.com; may be given more than once
 
 Pages served by the relay itself may always connect, when opened by IP
 address, as localhost or under this machine's own name.
 
-UDP ports 5900 and 5901 are bound on all addresses for the media bridge.`;
+By default the media bridge binds UDP 5900 and 5901 on all addresses; see
+--udp-local and --bind-source.`;
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -464,6 +466,8 @@ function serveStatic(webRoot, req, res) {
  *   allowOrigins      further web origins whose pages may connect ([])
  *   udpPorts          the target's UDP port for each media channel ([5900, 5901])
  *   udpLocalPorts     the local UDP port for each channel (same as udpPorts)
+ *   bindSource        local address for the TCP connect and the UDP sockets
+ *                     ('0.0.0.0'); any other value also accepts media from 127.*
  *   log               function taking one line (console.log)
  *   countersMs        interval of the media counters line (5000)
  * Resolves to { port, udpLocalPorts, close() } with the ports actually bound.
@@ -790,6 +794,7 @@ function parseArgs(argv) {
             if (parts[2] !== undefined) options.targetPort = parsePort(parts[2], flag);
         } else if (flag === '--udp-local') {
             options.udpLocalPorts = value.split(',').map(v => parsePort(v.trim(), flag));
+            if (options.udpLocalPorts.length !== 2) throw new Error(`${flag} takes two ports, one per media channel`);
         } else if (flag === '--bind-source') {
             options.bindSource = value;
         } else if (flag === '--web') {
