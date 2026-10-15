@@ -34,6 +34,8 @@ const USAGE = `usage: node relay/relay.mjs --listen PORT --target HOST[:PORT] [-
   --target HOST[:PORT]  the Mac to relay to; PORT is its TCP port (default 5900)
   --web DIR             directory of static files to serve (default: the repository root)
   --host ADDRESS        address to listen on (default 127.0.0.1)
+  --udp-local P1,P2     local UDP source ports per channel (default: same as target 5900,5901)
+  --bind-source ADDR    local source address for TCP connect and UDP sockets (default: 0.0.0.0)
   --allow-origin ORIGIN another web origin whose pages may connect, for example
                         https://viewer.example.com; may be given more than once
 
@@ -476,6 +478,7 @@ export async function startRelay(options = {}) {
         allowOrigins = [],
         udpPorts = [5900, 5901],
         udpLocalPorts = udpPorts,
+        bindSource = '0.0.0.0',
         log = console.log,
         countersMs = 5000,
     } = options;
@@ -515,7 +518,7 @@ export async function startRelay(options = {}) {
             socket.close();
             reject(new Error(`cannot bind UDP port ${port}: ${err.code || err.message}`));
         });
-        socket.bind(port, '0.0.0.0', () => {
+        socket.bind(port, bindSource, () => {
             socket.removeAllListeners('error');
             socket.on('error', err => log(`udp: port ${socket.address().port}: ${err.message}`));
             let got = 0;
@@ -561,7 +564,8 @@ export async function startRelay(options = {}) {
 
     udp.forEach((socket, n) => {
         socket.on('message', (datagram, rinfo) => {
-            if (rinfo.address !== targetIp) {
+            if (rinfo.address !== targetIp &&
+                !(bindSource !== '0.0.0.0' && rinfo.address.startsWith('127.'))) {
                 dropped.foreign++;
                 return;
             }
@@ -622,7 +626,8 @@ export async function startRelay(options = {}) {
 
     function bridgeTcp(ws, peer) {
         const id = nextId++;
-        const tcp = net.connect({ host: targetIp, port: targetPort });
+        const tcp = net.connect({ host: targetIp, port: targetPort,
+            ...(bindSource !== '0.0.0.0' ? { localAddress: bindSource } : {}) });
         let cause = null;
         let clientPaused = false;
         targets.add(tcp);
@@ -771,7 +776,7 @@ function parseArgs(argv) {
     for (let i = 0; i < argv.length; i += 2) {
         const flag = argv[i];
         const value = argv[i + 1];
-        if (!['--listen', '--target', '--web', '--host', '--allow-origin'].includes(flag)) {
+        if (!['--listen', '--target', '--web', '--host', '--allow-origin', '--udp-local', '--bind-source'].includes(flag)) {
             throw new Error(`unknown argument ${flag}`);
         }
         if (value === undefined) throw new Error(`${flag} needs a value`);
@@ -783,6 +788,10 @@ function parseArgs(argv) {
             if (!parts) throw new Error(`--target: "${value}" is not HOST or HOST:PORT`);
             options.targetHost = parts[1];
             if (parts[2] !== undefined) options.targetPort = parsePort(parts[2], flag);
+        } else if (flag === '--udp-local') {
+            options.udpLocalPorts = value.split(',').map(v => parsePort(v.trim(), flag));
+        } else if (flag === '--bind-source') {
+            options.bindSource = value;
         } else if (flag === '--web') {
             options.web = value;
         } else if (flag === '--allow-origin') {
