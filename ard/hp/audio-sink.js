@@ -14,7 +14,9 @@ export class AudioSink {
         return typeof AudioContext !== 'undefined' && typeof AudioWorkletNode !== 'undefined';
     }
 
-    static async create() {
+    // ring: PcmRing options for the worklet's buffer (pcm-ring.js), e.g.
+    // { adaptive: true }. Omitted, the buffer is the fixed 80 ms reserve.
+    static async create(ring) {
         const context = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: 'interactive' });
         try {
             await context.audioWorklet.addModule(new URL('./pcm-worklet.js', import.meta.url));
@@ -22,15 +24,16 @@ export class AudioSink {
             context.close();
             throw e;
         }
-        return new AudioSink(context);
+        return new AudioSink(context, ring);
     }
 
-    constructor(context) {
+    constructor(context, ring) {
         this._context = context;
         this._node = new AudioWorkletNode(context, 'ard-pcm', {
             numberOfInputs: 0,
             numberOfOutputs: 1,
             outputChannelCount: [2],
+            processorOptions: { ring: ring || {} },
         });
         // The gain is the mute: the decoder and buffer keep running, so
         // sound resumes in step when it is turned back on.

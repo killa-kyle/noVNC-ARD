@@ -7,9 +7,10 @@
 import { PcmRing } from './pcm-ring.js';
 
 class ArdPcmProcessor extends AudioWorkletProcessor {
-    constructor() {
+    constructor(options) {
         super();
-        this._ring = new PcmRing();
+        // processorOptions.ring: PcmRing options from AudioSink.create().
+        this._ring = new PcmRing((options && options.processorOptions && options.processorOptions.ring) || {});
         this._blocks = 0;
         this.port.onmessage = (e) => {
             const m = e.data;
