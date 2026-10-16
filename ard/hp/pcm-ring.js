@@ -14,15 +14,21 @@ export class PcmRing {
      * capacity: samples per channel the ring can hold
      * target:   reserve to build before playing, and to fall back to
      * limit:    more than this queued means the delay has grown; drop to target
-     * adaptive: grow the reserve when it runs dry, shrink it back slowly
-     *           (see _adapt); off by default, so a caller that does not ask
-     *           keeps exactly the fixed reserve above
-     * maxTarget, step, decayStep, decayAfter: the adaptive reserve's bounds,
-     *           in samples per channel
+     * adaptive: grow the reserve when it runs dry, shrink it back slowly,
+     *           and keep the delay close to it (see _adapt); off by default,
+     *           so a caller that does not ask keeps exactly the fixed
+     *           reserve above
+     * maxTarget, step, decayStep, decayAfter: the adaptive reserve's bounds
+     * headroom: adaptive only, how far over the reserve the queue may go
+     *           before it is trimmed back (replaces limit)
+     * drainOver, drainAfter: adaptive only, a queue more than drainOver over
+     *           the reserve for drainAfter samples played is trimmed back
+     * (all in samples per channel)
      */
     constructor({
         capacity = 24000, target = 3840, limit = 12000,
-        adaptive = false, maxTarget = 9600, step = 1920, decayStep = 480, decayAfter = 480000,
+        adaptive = false, maxTarget = 5760, step = 960, decayStep = 480, decayAfter = 480000,
+        headroom = 2880, drainOver = 1920, drainAfter = 96000,
     } = {}) {
         this._left = new Float32Array(capacity);
         this._right = new Float32Array(capacity);
@@ -35,8 +41,12 @@ export class PcmRing {
 
         this._adaptive = adaptive;
         this._baseTarget = target;
-        this._headroom = limit - target;
+        this._headroom = adaptive ? headroom : limit - target;
+        if (adaptive) this._limit = target + this._headroom;
         this._maxTarget = Math.max(target, maxTarget);
+        this._drainOver = drainOver;
+        this._drainAfter = drainAfter;
+        this._over = 0;     // samples played while the queue sat over reserve + drainOver
         this._step = step;
         this._decayStep = decayStep;
         this._decayAfter = decayAfter;
@@ -52,17 +62,35 @@ export class PcmRing {
      * Measured on a remote desktop 2026-10-16: 1 to 6 gaps and about 180 ms
      * discarded per 10 s with every packet arriving, from arrival spikes of
      * 40 to 190 ms against an 80 ms reserve. So each gap raises the reserve
-     * by `step` (up to maxTarget), the limit keeps its headroom above it, and
-     * every `decayAfter` samples without a gap it comes back down by
-     * `decayStep`, never below where it started. The added delay lasts only
-     * as long as the arrivals stay uneven.
+     * by `step` (up to maxTarget), and every `decayAfter` samples without a
+     * gap it comes back down by `decayStep`, never below where it started.
+     *
+     * Delay is what the listener notices, so it is held close to the
+     * reserve two ways. The trim limit sits only `headroom` above the
+     * reserve (not the fixed ring's 170 ms). And a queue that stays more
+     * than `drainOver` over the reserve for `drainAfter` samples is trimmed
+     * back to it in one small skip: otherwise the excess from a burst is
+     * never played off, because the card takes sound at exactly the rate it
+     * arrives. The first cut of this (200 ms reserve, 170 ms headroom, no
+     * drain) let the queue sit at 230 to 340 ms, and audio fell behind the
+     * picture.
      */
     _adapt(ranDry, played) {
         if (!this._adaptive) return;
         if (ranDry) {
             this._clean = 0;
+            this._over = 0;
             this._setTarget(Math.min(this._maxTarget, this._target + this._step));
             return;
+        }
+        if (this._length > this._target + this._drainOver) {
+            this._over += played;
+            if (this._over >= this._drainAfter) {
+                this._over = 0;
+                this._discard(this._length - this._target);
+            }
+        } else {
+            this._over = 0;
         }
         this._clean += played;
         if (this._clean >= this._decayAfter && this._target > this._baseTarget) {
