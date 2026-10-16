@@ -211,6 +211,15 @@ export class PcmRing {
             this._playing = true;
             this._fadeIn = true;
             this._frac = 0;
+            // A burst that landed while stopped is skipped here, as a plain
+            // cut: the last output was silence, so nothing jumps, and the
+            // block below fades in from the new position. Crossfading it
+            // instead would start at full level and spend the fade-in on the
+            // next block (two clicks).
+            if (this._pendingTrim > 0) {
+                this._discard(Math.min(this._pendingTrim, this._length - this._target));
+                this._pendingTrim = 0;
+            }
         }
 
         if (this._pendingTrim > 0) {
@@ -223,6 +232,7 @@ export class PcmRing {
                     left[i] = L[a] * (1 - w) + L[b] * w;
                     right[i] = R[a] * (1 - w) + R[b] * w;
                 }
+                this._fadeIn = false;   // only set on restart, which skips without a crossfade
                 const used = t + n;
                 this._read = this._at(used);
                 this._length -= used;
