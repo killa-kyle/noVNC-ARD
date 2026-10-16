@@ -47,6 +47,9 @@ export class PcmRing {
         this._drainOver = drainOver;
         this._drainAfter = drainAfter;
         this._over = 0;     // samples played while the queue sat over reserve + drainOver
+        this._frac = 0;         // adaptive: fractional read position (playback-rate control)
+        this._pendingTrim = 0;  // adaptive: samples to skip, crossfaded in the next read
+        this._fadeIn = false;   // adaptive: ramp up the next block (after a gap)
         this._step = step;
         this._decayStep = decayStep;
         this._decayAfter = decayAfter;
@@ -87,7 +90,7 @@ export class PcmRing {
             this._over += played;
             if (this._over >= this._drainAfter) {
                 this._over = 0;
-                this._discard(this._length - this._target);
+                this._pendingTrim = this._length - this._target;
             }
         } else {
             this._over = 0;
@@ -131,7 +134,13 @@ export class PcmRing {
         this.stats.written += n;
 
         if (this._length > this._limit) {
-            this._discard(this._length - this._target);
+            if (this._adaptive) {
+                // Skipped in the next read, crossfaded, rather than cut here:
+                // a cut is a jump between two unrelated samples, a click.
+                this._pendingTrim = this._length - this._target;
+            } else {
+                this._discard(this._length - this._target);
+            }
         }
     }
 
@@ -144,6 +153,7 @@ export class PcmRing {
 
     // Fill one output block. Silence while the reserve is being built.
     read(left, right) {
+        if (this._adaptive) return this._readAdaptive(left, right);
         const n = left.length;
         if (!this._playing && this._length >= this._target) this._playing = true;
         if (this._playing && this._length < n) {
@@ -166,6 +176,115 @@ export class PcmRing {
         this._length -= n;
         this.stats.played += n;
         this._adapt(false, n);
+        return true;
+    }
+
+    _at(k) {
+        let i = this._read + k;
+        if (i >= this._capacity) i -= this._capacity;
+        return i;
+    }
+
+    /*
+     * The adaptive read: no hard edges. Three things a fixed ring does with a
+     * jump, done smoothly instead (each a click in continuous music, measured
+     * as crackle 2026-10-16):
+     *
+     * - Delay is held at the reserve by playing a little fast or slow, up to
+     *   +/-0.5% (inaudible), in proportion to how far the queue is from the
+     *   reserve. This also absorbs the slow drift between the sender's sound
+     *   clock and this card's, which a fixed rate can only fix by trimming.
+     * - A trim (queue past the limit, or an excess that outlived the rate
+     *   control) is a one-block crossfade from the old position to the new.
+     * - Running dry fades out what is left instead of stopping mid-wave, and
+     *   playback resumes with a fade in.
+     */
+    _readAdaptive(left, right) {
+        const n = left.length;
+        const L = this._left, R = this._right;
+        if (!this._playing) {
+            if (this._length < this._target) {
+                left.fill(0);
+                right.fill(0);
+                return false;
+            }
+            this._playing = true;
+            this._fadeIn = true;
+            this._frac = 0;
+        }
+
+        if (this._pendingTrim > 0) {
+            const t = Math.min(this._pendingTrim, this._length - n - 1);
+            this._pendingTrim = 0;
+            if (t > 0) {
+                for (let i = 0; i < n; i++) {
+                    const w = (i + 1) / n;
+                    const a = this._at(i), b = this._at(t + i);
+                    left[i] = L[a] * (1 - w) + L[b] * w;
+                    right[i] = R[a] * (1 - w) + R[b] * w;
+                }
+                const used = t + n;
+                this._read = this._at(used);
+                this._length -= used;
+                this.stats.dropped += t;
+                this.stats.played += n;
+                this._frac = 0;
+                this._adapt(false, n);
+                return true;
+            }
+        }
+
+        const err = (this._length - this._target) / this._headroom;
+        const ratio = Math.min(1.005, Math.max(0.995, 1 + 0.005 * err));
+        this.stats.rate = ratio;
+        const need = Math.ceil(this._frac + n * ratio) + 1;
+        if (this._length < need) {
+            // Running dry: fade out what is here, then silence.
+            const m = this._length;
+            for (let i = 0; i < n; i++) {
+                if (i < m) {
+                    const g = 1 - i / m;
+                    const k = this._at(i);
+                    left[i] = L[k] * g;
+                    right[i] = R[k] * g;
+                } else {
+                    left[i] = 0;
+                    right[i] = 0;
+                }
+            }
+            this._read = this._at(m);
+            this._length = 0;
+            this.stats.played += m;
+            this._frac = 0;
+            this._playing = false;
+            this.stats.underruns++;
+            this._adapt(true, 0);
+            return true;
+        }
+
+        for (let i = 0; i < n; i++) {
+            const pos = this._frac + i * ratio;
+            const k = Math.floor(pos);
+            const f = pos - k;
+            const a = this._at(k), b = this._at(k + 1);
+            left[i] = L[a] + (L[b] - L[a]) * f;
+            right[i] = R[a] + (R[b] - R[a]) * f;
+        }
+        if (this._fadeIn) {
+            this._fadeIn = false;
+            for (let i = 0; i < n; i++) {
+                const g = (i + 1) / n;
+                left[i] *= g;
+                right[i] *= g;
+            }
+        }
+        const adv = this._frac + n * ratio;
+        const used = Math.floor(adv);
+        this._frac = adv - used;
+        this._read = this._at(used);
+        this._length -= used;
+        this.stats.played += used;
+        this._adapt(false, used);
         return true;
     }
 }
