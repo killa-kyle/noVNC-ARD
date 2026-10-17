@@ -1962,9 +1962,13 @@ RFB.prototype._handleWheel = function (ev) {
         dY *= 19 * 24;
     }
 
-    // Natural scrolling toggle: negate deltas to invert direction
+    // Natural scrolling: negate deltas to invert direction. A viewer that
+    // sets ardNaturalScrolling decides; otherwise ard.html's checkbox does.
     const natEl = document.getElementById('noVNC_setting_natural_scrolling');
-    if (natEl && natEl.checked) {
+    const natural = typeof this.ardNaturalScrolling === 'boolean'
+        ? this.ardNaturalScrolling
+        : !!(natEl && natEl.checked);
+    if (natural) {
         dX = -dX;
         dY = -dY;
     }
