@@ -16,6 +16,7 @@ import { parseMessage1, generateSecrets, buildOffer, parseAnswer, splitKeyBlock,
 import { createContext } from './srtp.js';
 import { VideoAssembler } from './rtp-video.js';
 import { receiverReport, pictureAck, rateControl } from './feedback.js';
+import { RateController, EVAL_MS } from './rate-control.js';
 import { extendSeq } from './seq.js';
 import { PAYLOAD_TYPE_HEVC } from './offer-template.js';
 
@@ -32,7 +33,9 @@ const ANSWER_MS = 5000;
 const FIRST_FRAME_MS = 5000;
 const REPORT_MS = 1000;
 const RATE_CONTROL_MS = 50;
-const IDLE_BANDWIDTH_KBIT = 60000;
+// A video packet seen within this window counts as "video flowing": the rate
+// controller only ramps while pictures arrive, and holds the ceiling when idle.
+const VIDEO_FLOW_MS = 500;
 
 // Nothing can be dropped from the stream without spoiling what follows, so
 // a viewer that cannot keep up falls further and further behind. Half a
@@ -156,6 +159,8 @@ export class HpSession {
         this._lastSenderReport = [null, null];   // per channel: { middle, at }
         this._decrypting = 0;                    // packets handed to SRTP and not back yet
         this._overloadedSince = null;
+        this._rateController = new RateController();
+        this._lastRateEvalAt = null;             // last time the estimator sampled
     }
 
     // The picture size and stripe count from the server's answer.
@@ -517,6 +522,11 @@ export class HpSession {
         this._lastMediaAt = this._now();
         this._lastVideoPacketAt = this._now();
         this._lastPictureAt = this._now();
+        // The reconfigured stream rebuilds the assembler (skipped restarts at
+        // 0), so the estimate re-probes from the ceiling rather than carrying a
+        // stale low value into the new size.
+        this._rateController.reset();
+        this._lastRateEvalAt = null;
         // The audio stream restarts with a new SSRC and sequence; let its
         // reorder take the new numbers, or every packet reads as late.
         if (this._audio && this._audio.resetStream) this._audio.resetStream();
@@ -712,12 +722,22 @@ export class HpSession {
         }
         if (!this._feedback.rateControl || this.state === 'failed') return;
         const sinceLast = this._lastVideoPacketAt === null ? 0 : now - this._lastVideoPacketAt;
+        // The report still goes out every tick (RATE_CONTROL_MS); only the
+        // bandwidth estimate is re-evaluated on the slower EVAL_MS cadence.
+        if (this._lastRateEvalAt === null || now - this._lastRateEvalAt >= EVAL_MS) {
+            this._lastRateEvalAt = now;
+            const videoFlowing = this._lastVideoPacketAt !== null && sinceLast <= VIDEO_FLOW_MS;
+            this._rateController.sample({
+                skipped: (this._assembler && this._assembler.diag.skipped) || 0,
+                videoFlowing,
+            });
+        }
         this._sendRtcp(CHANNEL_VIDEO, rateControl({
             ssrc: this._secrets.videoSsrc,
             a: this.stats.pictures & 0xffff,
             b: sinceLast,
             c: this.stats.videoPackets,
-            d: IDLE_BANDWIDTH_KBIT,
+            d: this._rateController.estimate(),
         }));
     }
 

@@ -547,6 +547,55 @@ describe('High Performance session', () => {
         deepStrictEqual(kinds, { rctl: 20, videoReport: 1, audioReport: 1 });
     });
 
+    it('adapts rate-control field D to assembler loss and holds the ceiling when idle', async () => {
+        const keys = await negotiate();
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        const videoReader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
+
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 100, don: 5, frame: 1 })));
+        await until(() => session.stats.pictures === 1, 'the first picture');
+        sinks[0].opts.onFirstFrame();
+        strictEqual(session.state, 'streaming');
+
+        // Read field D of the one RCTL packet a _tick emits. `skipped` stands in
+        // for the assembler's cumulative resync-drop count; `flowing` whether a
+        // video packet is recent, and `evalReset` whether this tick re-evaluates
+        // the estimate (true) or only re-sends the held one (false).
+        async function tickD({ skipped, flowing = true, evalReset = true }) {
+            Object.defineProperty(session._assembler, 'diag', { configurable: true, get: () => ({ skipped }) });
+            session._lastVideoPacketAt = flowing ? session._now() : session._now() - 10000;
+            if (evalReset) session._lastRateEvalAt = null;
+            ws.sent.length = 0;
+            session._tick();
+            await settle(4);
+            let d = null;
+            for (const msg of ws.sent) {
+                const plain = await videoReader.unprotectRtcp(msg.subarray(1));
+                ok(plain, 'our RTCP verifies');
+                if (plain[1] === 204 && String.fromCharCode(...plain.subarray(8, 12)) === 'RCTL') {
+                    d = new DataView(plain.buffer, plain.byteOffset).getUint16(30);
+                }
+            }
+            ok(d !== null, 'an RCTL packet was sent');
+            return d;
+        }
+
+        // No loss: the estimate sits at the ceiling (60000 kbit/s), as before.
+        strictEqual(await tickD({ skipped: 0 }), 60000);
+        // The assembler skips a picture: the estimate backs off.
+        const dropped = await tickD({ skipped: 5 });
+        ok(dropped < 60000, 'D backs off on loss, got ' + dropped);
+        // Loss stops (skipped holds steady): the estimate probes back up.
+        ok(await tickD({ skipped: 5 }) > dropped, 'D recovers when loss stops');
+        // Video goes idle: D returns to the ceiling however bad skipped looks.
+        strictEqual(await tickD({ skipped: 9999, flowing: false }), 60000);
+
+        // Within the eval window (no reset) the report still fires, carrying the
+        // held estimate — a fresh skipped spike does not move it until the next eval.
+        const held = await tickD({ skipped: 0 });                 // eval: back at ceiling
+        strictEqual(await tickD({ skipped: 500, evalReset: false }), held);
+    });
+
     it('sends only the feedback it is told to', async () => {
         const keys = await negotiate({ feedback: { reports: false, acks: false, rateControl: false } });
         const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
