@@ -555,6 +555,12 @@ export class HpSession {
             onPicture: p => this._onPicture(p),
             onStall: s => this._streamingFail('stalled', 'waiting for picture ' + s.expectedDon),
         });
+        // A fresh assembler means a fresh loss history: re-probe from the
+        // ceiling, the same as _swapMedia does when it rebuilds the assembler.
+        // (The constructor already starts here, but reset keeps the rule — a
+        // new assembler resets the estimator — stated at both build sites.)
+        this._rateController.reset();
+        this._lastRateEvalAt = null;
         this._sink = this._createSink({
             width: answer.video.width,
             height: answer.video.height,
@@ -728,7 +734,7 @@ export class HpSession {
             this._lastRateEvalAt = now;
             const videoFlowing = this._lastVideoPacketAt !== null && sinceLast <= VIDEO_FLOW_MS;
             this._rateController.sample({
-                skipped: (this._assembler && this._assembler.diag.skipped) || 0,
+                skipped: (this._assembler && this._assembler.diag && this._assembler.diag.skipped) || 0,
                 videoFlowing,
             });
         }
