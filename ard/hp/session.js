@@ -199,7 +199,7 @@ export class HpSession {
         this.stats = {
             videoPackets: 0, videoBytes: 0, audioPackets: 0, audioBytes: 0, rtcpPackets: 0,
             authFailures: 0, pictures: 0, keyPictures: 0, sent: 0, controlFrames: 0, controlRejected: 0,
-            keyRequests: 0, keyWaits: 0, keyAnswered: 0,
+            keyRequests: 0, keyWaits: 0, keyAnswered: 0, keyHealed: 0,
         };
 
         this._ws = null;
@@ -229,7 +229,7 @@ export class HpSession {
         this._decrypting = 0;                    // packets handed to SRTP and not back yet
         this._overloadedSince = null;
         // Asking for a key picture, per live stream.
-        this._keyWait = null;                    // { reason, at, requests, retries } while asking
+        this._keyWait = null;                    // { reason, at, requests, retries, healable } while asking
         this._firSeq = 0;                        // the last FIR's sequence number
         this._streamVideoAt = null;              // the stream's first video packet
         this._streamKeySeen = false;             // the stream has had a key picture
@@ -963,6 +963,16 @@ export class HpSession {
                 this._warn('key picture after ' + Math.round(this._now() - w.at) + ' ms, ' +
                            w.requests + ' request(s) (' + w.reason + ')');
             }
+        } else if (this._keyWait && this._keyWait.healable &&
+                   this._assembler && !this._assembler.waitingForKey) {
+            // The assembler's wait ended by itself: the picture it waited
+            // for came late (or the stall was a gap in one picture), and
+            // emission goes on in order. Nothing more to ask for.
+            const w = this._keyWait;
+            this._keyWait = null;
+            this.stats.keyHealed++;
+            this._warn('key wait ended: picture arrived late after ' + Math.round(this._now() - w.at) + ' ms, ' +
+                       w.requests + ' request(s) (' + w.reason + ')');
         }
         if (this._sink) this._sink.push(picture);
         if (this._feedback.acks) {
@@ -983,10 +993,13 @@ export class HpSession {
         return (this.state === 'streaming' || this.state === 'waiting') && !this._reoffering;
     }
 
-    _startKeyWait(reason) {
+    // `healable`: the assembler asked (a lost picture), so the wait also
+    // ends if the assembler resumes in order by itself. A stream with no
+    // key picture yet cannot heal: only a key picture ends that wait.
+    _startKeyWait(reason, healable = true) {
         if (!this._keyWaitAllowed() || this._keyWait) return;
         this.stats.keyWaits++;
-        this._keyWait = { reason, at: this._now(), requests: 0, retries: 0 };
+        this._keyWait = { reason, at: this._now(), requests: 0, retries: 0, healable };
         this._warn('requesting key picture (' + reason + ')');
         this._requestKey(false);
     }
@@ -1023,7 +1036,7 @@ export class HpSession {
                 this._startKeyWait('waiting for picture ' + this._assembler.diag.next);
             } else if (this._streamVideoAt !== null && !this._streamKeySeen &&
                        now - this._streamVideoAt >= KEY_FIRST_MS) {
-                this._startKeyWait('no key picture yet');
+                this._startKeyWait('no key picture yet', false);
             }
             return;
         }

@@ -886,6 +886,61 @@ describe('High Performance session', () => {
         strictEqual(session.state, 'failed');
     });
 
+    it('ends a key wait the stream healed on its own', async () => {
+        const warns = [];
+        const { videoIn } = await lostPicture({ warn: m => warns.push(m) });
+        pass(500);
+        await until(() => keyRequests().length === 2, 'the FIR at +300');
+        // The missing picture turns up late: emission resumes at it.
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 1, seq: 1, don: 11, frame: 1 })));
+        await until(() => session.stats.keyHealed === 1, 'the wait to end');
+        ok(warns.some(w => /^key wait ended: picture arrived late after \d+ ms, 2 request\(s\) \(waiting for picture 11\)$/.test(w)),
+           warns.join('; '));
+        deepStrictEqual(sinks[0].pictures.map(p => p.don & 0xffff), [10, 11, 12]);
+        strictEqual(session.stats.keyAnswered, 0);
+        pass(2000);
+        await settle();
+        strictEqual(keyRequests().length, 2, 'no requests after it healed');
+        strictEqual(session.stats.keyRequests, 2);
+        ok(!warns.some(w => w.startsWith('glitch') || w.startsWith('recovering')), warns.join('; '));
+        strictEqual(offers.length, 1, 'no recovery');
+        strictEqual(session.state, 'streaming');
+    });
+
+    it('still gives up when the stream does not heal', async () => {
+        const warns = [];
+        const { videoIn } = await lostPicture({ warn: m => warns.push(m) });
+        pass(500);
+        // A later picture completes, but the missing one never comes.
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 3, seq: 1, don: 13, frame: 1 })));
+        await until(() => session.stats.videoPackets === 3, 'the packet');
+        pass(1500);
+        await until(() => offers.length === 2, 'the recovery re-offer');
+        ok(warns.includes('recovering from stalled (no key picture), attempt 1 of 3'), warns.join('; '));
+        strictEqual(session.stats.keyHealed, 0);
+        strictEqual(session.stats.keyAnswered, 0);
+    });
+
+    it('a key wait for a stream with no key picture does not end on a late picture', async () => {
+        const keys = await stream();
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        // No key picture: the stream's first packet is a later picture.
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 2, seq: 1, don: 5, frame: 1 })));
+        await until(() => session.stats.videoPackets === 1, 'the packet');
+        pass(1000);
+        await until(() => keyRequests().length === 1, 'the PLI at +1000');
+        // An earlier picture arrives late; still nothing to start from.
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 1, seq: 1, don: 4, frame: 1 })));
+        await until(() => session.stats.videoPackets === 2, 'the late packet');
+        pass(300);
+        await until(() => keyRequests().length === 2, 'the FIR at +1300');
+        strictEqual(session.stats.keyHealed, 0);
+        strictEqual(session.stats.keyWaits, 1);
+        pass(1700);
+        await until(() => offers.length === 2, 'the recovery re-offer');
+        strictEqual(session.stats.keyHealed, 0);
+    });
+
     it('asks for a key picture when a new stream has none after KEY_FIRST_MS', async () => {
         const warns = [];
         const keys = await stream({ warn: m => warns.push(m) });
