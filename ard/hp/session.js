@@ -943,10 +943,15 @@ export class HpSession {
     // ----- key pictures -----
 
     // Ask the Mac for a key picture: a PLI now, then by turns a FIR and a
-    // PLI every KEY_RETRY_MS (_driveKeyWait) until one comes. Not while a
-    // re-offer is out: the stream that answers it starts with one.
+    // PLI every KEY_RETRY_MS (_driveKeyWait) until one comes. Also before
+    // the first picture (a stream whose first key picture was lost). Not
+    // while a re-offer is out: the stream that answers it starts with one.
+    _keyWaitAllowed() {
+        return (this.state === 'streaming' || this.state === 'waiting') && !this._reoffering;
+    }
+
     _startKeyWait(reason) {
-        if (this.state !== 'streaming' || this._reoffering || this._keyWait) return;
+        if (!this._keyWaitAllowed() || this._keyWait) return;
         this.stats.keyWaits++;
         this._keyWait = { reason, at: this._now(), requests: 0, retries: 0 };
         this._warn('requesting key picture (' + reason + ')');
@@ -974,8 +979,11 @@ export class HpSession {
     // KEY_FIRST_MS after its first video packet); ask again on KEY_RETRY_MS;
     // give up after KEY_WAIT_MS with a recovery. An answered wait is no tier
     // trigger: a tier change restarts the stream and would undo the repair.
+    // Before the first picture there is no giving up here: FIRST_FRAME_MS
+    // is the limit. A wait that began then and is still running once
+    // streaming gives up by the time it began.
     _driveKeyWait(now) {
-        if (this.state !== 'streaming' || this._reoffering) return;
+        if (!this._keyWaitAllowed()) return;
         const w = this._keyWait;
         if (!w) {
             if (this._assembler && this._assembler.waitingForKey) {
@@ -987,7 +995,7 @@ export class HpSession {
             return;
         }
         const elapsed = now - w.at;
-        if (elapsed >= KEY_WAIT_MS) {
+        if (elapsed >= KEY_WAIT_MS && this.state === 'streaming') {
             this._keyWait = null;
             this._streamingFail('stalled', 'no key picture');
             return;
