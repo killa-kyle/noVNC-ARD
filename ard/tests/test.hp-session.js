@@ -189,10 +189,10 @@ function keyPicturePacket({ stripe, seq, don, frame, ts }) {
 
 // The first of a picture's two packets, a non-key slice: without the second
 // the picture never completes.
-function firstOfTwoPacket({ stripe, seq, don, frame }) {
+function firstOfTwoPacket({ stripe, seq, don, frame, ts }) {
     const payload = [0x02, 0x01, ...u16(don), 0xd0 + stripe, 1, 2, 3];
     return new Uint8Array([
-        0x90, 100, ...u16(seq), ...u32(frame * 400), ...u32(SERVER_VIDEO_SSRC + stripe),
+        0x90, 100, ...u16(seq), ...u32(ts !== undefined ? ts : frame * 400), ...u32(SERVER_VIDEO_SSRC + stripe),
         0x93, 0x11, 0x00, 0x01, ...u16(2), ...u16(frame),
         ...payload,
     ]);
@@ -743,11 +743,42 @@ describe('High Performance session', () => {
         strictEqual(states.filter(s => s.startsWith('failed')).length, 1);
     });
 
-    it('fails when the sink reports a decoder error', async () => {
+    it('fails when the sink reports a decoder error before the first picture', async () => {
         await negotiate();
         sinks[0].opts.onError('boom');
         deepStrictEqual(states, ['offering', 'waiting', 'failed:decoder']);
         strictEqual(session.failure, 'decoder: boom');
+    });
+
+    it('recovers from a decoder error while streaming', async () => {
+        const warns = [];
+        await stream({ warn: m => warns.push(m) });
+        sinks[0].opts.onError('boom');
+        ok(warns.some(w => w.startsWith('glitch decoder (boom)')), warns.join('; '));
+        ok(warns.includes('recovering from decoder (boom), attempt 1 of 3'), warns.join('; '));
+        await until(() => offers.length === 2, 'the recovery re-offer');
+        strictEqual(session.state, 'streaming');
+    });
+
+    it('recovers from a decoder error of a swapped-in sink, and ignores the old sink', async () => {
+        const warns = [], logs = [];
+        await stream({ warn: m => warns.push(m), log: m => logs.push(m) });
+        session.reoffer();
+        await until(() => offers.length === 2, 'the resize offer');
+        session.handleAnswer(await answerWith({
+            audioSsrc: 0x11112222, videoSsrc: 0x33334444, width: 2560, height: 1440, stripes: 4 }));
+        await until(() => sinks.length === 2, 'the new sink');
+        // The old sink, on its way out, is no longer the picture.
+        sinks[0].opts.onError('late');
+        await settle();
+        strictEqual(session.state, 'streaming');
+        strictEqual(offers.length, 2, 'no recovery for the old sink');
+        // The new one is.
+        sinks[1].opts.onError('bad');
+        ok(logs.includes('resize sink error: bad'), logs.join('; '));
+        ok(warns.includes('recovering from decoder (bad), attempt 1 of 3'), warns.join('; '));
+        await until(() => offers.length === 3, 'the recovery re-offer');
+        strictEqual(session.state, 'streaming');
     });
 
     // ----- key pictures -----
@@ -775,13 +806,14 @@ describe('High Performance session', () => {
         const keys = await stream(extra);
         const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
         const reader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
+        const sentAt = Date.now();      // RTP time 400 (frame 1)
         ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 1, don: 10, frame: 1 })));
         ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 2, seq: 9, don: 12, frame: 1 })));
         await until(() => session.stats.videoPackets === 2, 'both packets');
         for (let i = 0; i < 8 && session.stats.keyWaits === 0; i++) mock.timers.tick(50);
         strictEqual(session.stats.keyWaits, 1, 'a key wait started');
         await until(() => keyRequests().length === 1, 'the first request');
-        return { keys, videoIn, reader };
+        return { keys, videoIn, reader, sentAt };
     }
 
     it('sends a PLI when the assembler needs a key picture', async () => {
@@ -961,7 +993,7 @@ describe('High Performance session', () => {
             await until(() => session.stats.audioPackets === seq + 1, 'the audio packet');
             pass(1000);
         }
-        strictEqual(session.reoffering(), false, 'the re-offer was given up');
+        strictEqual(session.reoffering(), false, 'the re-offer was given up: ' + warns.join('; '));
         strictEqual(keyRequests().length, 1, 'nothing while it was out');
         // The old assembler is still waiting: a new wait asks again.
         pass(50);
@@ -1058,6 +1090,91 @@ describe('High Performance session', () => {
         strictEqual(session.state, 'streaming');
     });
 
+    it('does not call the last packets before a still screen a freeze', async () => {
+        const warns = [];
+        const keys = await stream({ warn: m => warns.push(m) });
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        const audio = await createContext(keys.audio.fromServer.key, keys.audio.fromServer.salt);
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 1, don: 1, frame: 1 })));
+        await until(() => session.stats.pictures === 1, 'the picture');
+        // 100 ms later a last packet that completes no picture (a repeat of
+        // the one shown), then a still screen: sound only, for 10 s.
+        pass(100);
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 2, don: 1, frame: 1 })));
+        await until(() => session.stats.videoPackets === 2, 'the packet');
+        for (let seq = 0; seq < 10; seq++) {
+            ws.deliver(CHANNEL_AUDIO, await audio.protectRtp(audioPacket(seq)));
+            await until(() => session.stats.audioPackets === seq + 1, 'the audio packet');
+            pass(1000);
+        }
+        await settle();
+        ok(!warns.some(w => w.startsWith('glitch')), warns.join('; '));
+        strictEqual(offers.length, 1, 'no re-offer');
+        strictEqual(session.stats.keyWaits, 0);
+        strictEqual(session.state, 'streaming');
+    });
+
+    it('repairs a last picture before a still screen that lost a packet', async () => {
+        const warns = [];
+        const keys = await stream({ warn: m => warns.push(m) });
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        const reader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
+        const audio = await createContext(keys.audio.fromServer.key, keys.audio.fromServer.salt);
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 1, don: 1, frame: 1 })));
+        await until(() => session.stats.pictures === 1, 'the picture');
+        // 100 ms later the first half of picture 2; its second half is lost,
+        // and the screen goes still.
+        pass(100);
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(firstOfTwoPacket({ stripe: 0, seq: 2, don: 2, frame: 2 })));
+        await until(() => session.stats.videoPackets === 2, 'the packet');
+        pass(300);
+        await until(() => keyRequests().length === 1, 'the PLI');
+        strictEqual(await readRequest(reader, keyRequests()[0]),
+                    hex(pli({ ssrc: session._secrets.videoSsrc, mediaSsrc: SERVER_VIDEO_SSRC })));
+        ok(warns.includes('requesting key picture (waiting for picture 2)'), warns.join('; '));
+        // The Mac answers; then sound only, for 10 s.
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 3, don: 3, frame: 3 })));
+        await until(() => session.stats.keyAnswered === 1, 'the answer');
+        ok(sinks[0].pictures.some(p => (p.don & 0xffff) === 3 && p.key), 'the key picture is shown');
+        for (let seq = 0; seq < 10; seq++) {
+            ws.deliver(CHANNEL_AUDIO, await audio.protectRtp(audioPacket(seq)));
+            await until(() => session.stats.audioPackets === seq + 1, 'the audio packet');
+            pass(1000);
+        }
+        await settle();
+        ok(!warns.some(w => w.startsWith('glitch') || w.startsWith('recovering')), warns.join('; '));
+        strictEqual(offers.length, 1, 'no re-offer');
+        strictEqual(session.stats.keyWaits, 1);
+        strictEqual(session.state, 'streaming');
+    });
+
+    it('asks for a key picture, not a recovery, after a re-offer that came to nothing while video flowed', async () => {
+        const warns = [];
+        const { videoIn, reader, sentAt } = await lostPicture({ warn: m => warns.push(m) });
+        session.reoffer();
+        await until(() => offers.length === 2, 'the resize offer');
+        // No answer comes; the old stream's video keeps flowing (complete
+        // pictures, held behind the lost one) past the re-offer's 5 s, its
+        // RTP time keeping pace with arrival (90 units per ms).
+        for (let i = 0; i < 55; i++) {
+            const ts = 400 + 90 * (Date.now() - sentAt);
+            ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(
+                keyPicturePacket({ stripe: 2, seq: 10 + i, don: 13 + i, frame: 2 + i, ts })));
+            await until(() => session.stats.videoPackets === 3 + i, 'the packet');
+            pass(100);
+        }
+        ok(!warns.some(w => w.startsWith('glitch') || w.startsWith('recovering')), warns.join('; '));
+        strictEqual(session.reoffering(), false, 'the re-offer was given up: ' + warns.join('; '));
+        // The old assembler still waits: asked again, a PLI first.
+        await until(() => keyRequests().length >= 2, 'the PLI');
+        strictEqual(session.stats.keyWaits, 2);
+        strictEqual(await readRequest(reader, keyRequests()[1]),
+                    hex(pli({ ssrc: session._secrets.videoSsrc, mediaSsrc: SERVER_VIDEO_SSRC })));
+        ok(!warns.some(w => w.startsWith('glitch') || w.startsWith('recovering')), warns.join('; '));
+        strictEqual(offers.length, 2, 'no recovery');
+        strictEqual(session.state, 'streaming');
+    });
+
     it('does not time the first key picture from a packet of another stream', async () => {
         const keys = await stream();
         const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
@@ -1078,10 +1195,12 @@ describe('High Performance session', () => {
         const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
         ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 1, don: 1, frame: 1 })));
         await until(() => session.stats.pictures === 1, 'the first picture');
-        // Every 100 ms the first half of a new picture, never the second.
-        for (let i = 0; i < 31; i++) {
+        // Every 100 ms the first half of a new picture, never the second,
+        // for more than 3 s (RTP time keeping pace, 9000 units per 100 ms,
+        // so the tier controller sees no queue).
+        for (let i = 0; i < 32; i++) {
             ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(
-                firstOfTwoPacket({ stripe: 0, seq: 2 + i, don: 2 + i, frame: 2 + i })));
+                firstOfTwoPacket({ stripe: 0, seq: 2 + i, don: 2 + i, frame: 2 + i, ts: 9000 * (1 + i) })));
             await until(() => session.stats.videoPackets === 2 + i, 'the packet');
             pass(100);
         }

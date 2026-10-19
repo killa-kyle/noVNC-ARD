@@ -117,7 +117,7 @@ const RESIZE_SHOW_MS = 2500;
 // that the trouble is not passing, and it falls back to Standard.
 const RECOVERY_MAX = 3;
 const RECOVERY_WINDOW_MS = 30000;
-const RECOVERABLE = new Set(['stalled', 'media-stopped', 'overloaded']);
+const RECOVERABLE = new Set(['stalled', 'media-stopped', 'overloaded', 'decoder']);
 
 // RTP clock rates of the two streams, in units per second.
 const VIDEO_CLOCK = 90000;
@@ -729,7 +729,11 @@ export class HpSession {
             height: answer.video.height,
             stripes: answer.video.stripes,
             onFirstPicture: () => showNew(),
-            onError: reason => { this._log('resize sink error: ' + reason); showNew(); },
+            onError: (reason) => {
+                this._log('resize sink error: ' + reason);
+                showNew();
+                this._sinkError(sink, reason);
+            },
         });
         const showTimer = this._timeout(RESIZE_SHOW_MS, () => {
             this._log('resize: first picture slow; showing anyway');
@@ -767,6 +771,21 @@ export class HpSession {
                   ', ' + answer.video.stripes + ' stripes, tier ' + this.tier + ' kbit/s');
     }
 
+    // The sink's decoder failed; that sink is unusable. Before the first
+    // picture the session fails. While streaming the current sink's failure
+    // is a glitch: a recovery re-offer brings a new stream and a new sink
+    // (a resync can start a decoder on a picture it cannot take). A sink
+    // already replaced shows nothing any more.
+    _sinkError(sink, reason) {
+        if (this.state === 'waiting') {
+            this._fail('decoder', reason);
+        } else if (sink === this._sink) {
+            this._streamingFail('decoder', reason);
+        } else {
+            this._log('old sink error: ' + reason);
+        }
+    }
+
     async _startMedia(payload) {
         const answer = await parseAnswer(payload);
         const audio = splitKeyBlock(this._secrets.audioKeys);
@@ -787,7 +806,7 @@ export class HpSession {
             onPicture: p => this._onPicture(p),
             onNeedKey: s => this._startKeyWait('waiting for picture ' + s.expectedDon),
         });
-        this._sink = this._createSink({
+        const sink = this._sink = this._createSink({
             width: answer.video.width,
             height: answer.video.height,
             stripes: answer.video.stripes,
@@ -798,7 +817,7 @@ export class HpSession {
                     this._setState('streaming');
                 }
             },
-            onError: reason => this._fail('decoder', reason),
+            onError: reason => this._sinkError(sink, reason),
         });
         this._log('answer: ' + answer.video.width + 'x' + answer.video.height +
                   ', ' + answer.video.stripes + ' stripes');
@@ -1064,12 +1083,18 @@ export class HpSession {
             this._streamingFail('media-stopped');
         }
         // Video still coming but no finished picture for a while: frozen.
-        // Counted from the later of the last picture and the start of the
-        // current flow, so a still screen that changes is not one.
+        // Only video that has flowed, with no VIDEO_GAP_MS break, for more
+        // than PICTURE_STALL_MS past the later of the last picture and the
+        // start of the flow, and is flowing still: a still screen that
+        // changes is not one, nor are the last packets before one. A wait
+        // for a key picture (the session's or the assembler's) has its own
+        // limit.
         if (this.state === 'streaming' && !this._reoffering && !this._keyWait &&
+            !(this._assembler && this._assembler.waitingForKey) &&
             this._lastPictureAt !== null && this._videoFlowSince !== null &&
-            now - Math.max(this._lastPictureAt, this._videoFlowSince) > PICTURE_STALL_MS &&
-            this._lastVideoPacketAt !== null && now - this._lastVideoPacketAt < PICTURE_STALL_MS) {
+            this._lastVideoPacketAt !== null &&
+            this._lastVideoPacketAt - Math.max(this._lastPictureAt, this._videoFlowSince) > PICTURE_STALL_MS &&
+            now - this._lastVideoPacketAt < VIDEO_GAP_MS) {
             this._streamingFail('stalled', 'no new picture');
         }
         this._driveKeyWait(now);

@@ -14,14 +14,15 @@
  * assembler resyncs forward to the nearest complete key picture — an IRAP is a
  * random-access point, decodable with no predecessor — dropping the gap. Only
  * when no key picture is buffered does onNeedKey fire; the assembler keeps
- * collecting and resumes at the next key picture.
+ * collecting and resumes at the next key picture, or at the missing one
+ * should it complete late.
  *
  * Payloads are kept by reference until their picture is emitted or dropped.
  */
 
 import { seqDelta, extendSeq } from './seq.js';
 
-const MAX_BUFFERED = 512;       // pictures collecting or waiting; more means the stream is lost
+const MAX_BUFFERED = 512;       // pictures collecting or waiting; past it, the oldest go
 
 const TYPE_AGGREGATION = 48;
 const TYPE_FRAGMENT = 49;
@@ -151,7 +152,7 @@ export class VideoAssembler {
         this._ref = null;               // first wire DON seen; unwrap reference until the start
         this._first = null;             // DON of the first key picture
         this._next = null;              // next DON to emit; null until the first key picture
-        this._waiting = false;          // lost a picture; dropping until a key picture
+        this._waiting = false;          // lost a picture; holding until a key picture or the late one
 
         this.stats = {
             packets: 0,         // every push
@@ -160,7 +161,7 @@ export class VideoAssembler {
             duplicates: 0,      // packet already held or its picture already emitted
             pictures: 0,        // emitted
             discarded: 0,       // dropped for preceding the first key picture
-            skipped: 0,         // dropped by a resync forward past a missing picture, 
+            skipped: 0,         // dropped by a resync forward past a missing picture, or by the MAX_BUFFERED trim while waiting
         };
     }
 
@@ -218,7 +219,7 @@ export class VideoAssembler {
 
         let pic = this._pictures.get(don);
         if (!pic) {
-            pic = { don, stripe, frame, count, parts: new Map(), data: null, key: false, doneAt: 0 };
+            pic = { don, stripe, frame, count, parts: new Map(), data: null, key: false, doneAt: 0, lastPartAt: 0 };
             this._pictures.set(don, pic);
         } else if (pic.stripe !== stripe || pic.count !== count) {
             stats.malformed++;
@@ -233,6 +234,7 @@ export class VideoAssembler {
             return;
         }
         pic.parts.set(seq, part);
+        pic.lastPartAt = nowMs;
         if (pic.parts.size < pic.count) return;
 
         const built = assemble(inSequenceOrder(pic.parts));
@@ -248,11 +250,13 @@ export class VideoAssembler {
         if (this._next === null) {
             if (pic.key) this._start(pic);
         } else if (this._waiting) {
-            // Only a key picture ends the wait. Keep everything else: a later
+            // The missing picture, late, ends the wait with nothing skipped;
+            // a key picture after it ends it by a resync. Keep the rest: a later
             // picture may complete before the key picture it follows, and
             // _checkStall bounds what is held
-            if (pic.key) this._resyncToKey();
-            return;
+            if (pic.don === this._next) this._waiting = false;
+            else if (pic.key) this._resyncToKey();
+            else return;
         }
         this._emit();
     }
@@ -302,15 +306,21 @@ export class VideoAssembler {
     _checkStall(nowMs) {
         if (!this._waiting) {
             let stall = this._pictures.size > MAX_BUFFERED;
-            if (!stall && this._next !== null) {
-                // The expected picture is not complete, so every complete picture
-                // held here is a later one waiting for it
+            if (!stall && this._next !== null && this._pictures.size > 0) {
+                // The expected picture is not complete, so nothing held here
+                // can be emitted. It is lost when a later complete picture has
+                // waited for it past stallMs, or when no part of anything held
+                // has come for stallMs: the last picture before a still screen
+                // lost a packet, and nothing later will show it
+                let newestPart = -Infinity;
                 for (const pic of this._pictures.values()) {
                     if (pic.data !== null && nowMs - pic.doneAt > this._stallMs) {
                         stall = true;
                         break;
                     }
+                    if (pic.lastPartAt > newestPart) newestPart = pic.lastPartAt;
                 }
+                if (!stall && nowMs - newestPart > this._stallMs) stall = true;
             }
             if (!stall) return;
 

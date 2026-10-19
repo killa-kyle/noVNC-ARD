@@ -451,7 +451,6 @@ describe('VideoAssembler waiting for a key picture', () => {
         strictEqual(h.asm.waitingForKey, true);
 
         // Nothing is emitted while waiting, and it asks only once
-        h.push(trailPicture(11), 1220);
         h.push(trailPicture(14), 1230);
         h.asm.tick(5000);
         strictEqual(h.pictures.length, 1);
@@ -459,6 +458,23 @@ describe('VideoAssembler waiting for a key picture', () => {
         strictEqual(h.asm.stats.pictures, 1);
         strictEqual(h.asm.stats.ignored, 0);
         strictEqual(h.asm.diag.waitingKey, true);
+    });
+
+    it('ends a wait when the missing picture completes late, skipping nothing', () => {
+        const h = harness();
+        const slow = picture({ stripe: 1 }, fragments(nal(TRAIL, 60), 11, 2));
+        h.push(keyPicture(10), 0);
+        h.push([slow[0]], 10);
+        h.push(trailPicture(12), 20);
+        h.asm.tick(300);
+        strictEqual(h.asm.waitingForKey, true);
+        deepStrictEqual(h.pictures.map(p => p.don), [10]);
+
+        h.push([slow[1]], 400);                              // 11's last packet, late
+        deepStrictEqual(h.pictures.map(p => p.don), [10, 11, 12]);
+        strictEqual(h.asm.waitingForKey, false);
+        strictEqual(h.asm.stats.skipped, 0);
+        strictEqual(h.needs.length, 1);
     });
 
     it('resumes at the next complete key picture after a wait', () => {
@@ -559,14 +575,44 @@ describe('VideoAssembler waiting for a key picture', () => {
         strictEqual(h.needs.length, 0);
     });
 
-    it('does not wait on an incomplete picture with nothing waiting behind it', () => {
+    it('waits when the last picture before a still screen stays incomplete', () => {
         const h = harness();
         const slow = picture({ stripe: 1 }, fragments(nal(TRAIL, 60), 11, 2));
         h.push(keyPicture(10), 0);
-        h.push([slow[0]], 10);
-        h.asm.tick(5000);
+        h.push([slow[0]], 10);                               // its second packet is lost
+        h.asm.tick(210);                                     // quiet exactly 200 ms
         strictEqual(h.needs.length, 0);
+        h.asm.tick(211);
+        deepStrictEqual(h.needs, [{ expectedDon: 11, buffered: 1 }]);
+        strictEqual(h.asm.waitingForKey, true);
+        h.asm.tick(5000);
+        strictEqual(h.needs.length, 1);
+
+        // Should the lost packet turn up after all, emission resumes there
         h.push([slow[1]], 5001);
+        deepStrictEqual(h.pictures.map(p => p.don), [10, 11]);
+        strictEqual(h.asm.waitingForKey, false);
+    });
+
+    it('waits when the expected picture is lost and a later one stays incomplete', () => {
+        const h = harness();
+        const later = picture({ stripe: 2 }, fragments(nal(TRAIL, 60), 12, 2));
+        h.push(keyPicture(10), 0);
+        h.push([later[0]], 10);                              // 11 lost, 12 half there
+        h.asm.tick(211);
+        deepStrictEqual(h.needs, [{ expectedDon: 11, buffered: 1 }]);
+    });
+
+    it('does not wait on a picture whose packets are still coming', () => {
+        const h = harness();
+        const slow = picture({ stripe: 1 }, fragments(nal(TRAIL, 120), 11, 4));
+        h.push(keyPicture(10), 0);
+        for (let i = 0; i < 4; i++) {
+            h.asm.tick(i * 150);
+            h.push([slow[i]], i * 150);
+        }
+        h.asm.tick(1000);
+        strictEqual(h.needs.length, 0);
         deepStrictEqual(h.pictures.map(p => p.don), [10, 11]);
     });
 
@@ -590,10 +636,14 @@ describe('VideoAssembler waiting for a key picture', () => {
         strictEqual(h.asm.diag.buffered, 512);
         strictEqual(h.asm.stats.skipped, 1);
 
-        // The late picture is not a key picture: dropped, not emitted
+        // The late picture resumes emission; it stops again at 102, which
+        // the bound dropped
         h.push(trailPicture(101), 0);
-        strictEqual(h.pictures.length, 1);
-        strictEqual(h.asm.waitingForKey, true);
+        deepStrictEqual(h.pictures.map(p => p.don), [100, 101]);
+        strictEqual(h.asm.waitingForKey, false);
+        h.asm.tick(201);
+        strictEqual(h.needs.length, 2);
+        strictEqual(h.needs[1].expectedDon, 102);
     });
 
     it('waits, then starts, when no key picture arrives within 512 pictures', () => {
