@@ -1644,11 +1644,6 @@ RFB.prototype._ardHpResize = function (display) {
 
 // Ask the running High Performance session for another video bit-rate tier
 // (kbit/s). It takes a re-offer; false when none can start now.
-// DIAGNOSTIC (temporary): ask the Mac for a key picture ('pli' or 'fir').
-RFB.prototype.ardHpRequestKey = function (kind = 'pli', compound = true) {
-    return !!this._ardHp && this._ardHp.requestKeyPicture(kind, compound);
-};
-
 RFB.prototype.ardHpSetTier = function (tier) {
     this._ardHpTier = tier;
     return !!this._ardHp && this._ardHp.setTier(tier);

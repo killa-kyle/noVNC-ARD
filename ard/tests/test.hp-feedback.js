@@ -7,7 +7,7 @@
 import { describe, it } from 'node:test';
 import { deepStrictEqual, strictEqual, ok } from 'node:assert';
 
-import { receiverReport, pictureAck, rateControl, keyRequest } from '../hp/feedback.js';
+import { receiverReport, pictureAck, rateControl, pli, fir } from '../hp/feedback.js';
 
 // Helper: hex string → Uint8Array
 function hex(s) {
@@ -224,13 +224,19 @@ describe('rateControl', () => {
     });
 });
 
-describe('keyRequest (diagnostic)', () => {
+describe('pli', () => {
     it('builds a PLI naming the media source', () => {
-        strictEqual(toHex(keyRequest({ ssrc: 0x11223344, mediaSsrc: 0xaabbccdd, kind: 'pli' })),
+        strictEqual(toHex(pli({ ssrc: 0x11223344, mediaSsrc: 0xaabbccdd })),
                     '81ce0002' + '11223344' + 'aabbccdd');
     });
+});
+
+describe('fir', () => {
     it('builds a FIR with the source and sequence in its FCI', () => {
-        strictEqual(toHex(keyRequest({ ssrc: 0x11223344, mediaSsrc: 0xaabbccdd, kind: 'fir', seq: 7 })),
+        strictEqual(toHex(fir({ ssrc: 0x11223344, mediaSsrc: 0xaabbccdd, seq: 7 })),
                     '84ce0004' + '11223344' + '00000000' + 'aabbccdd' + '07000000');
+    });
+    it('keeps the sequence to 8 bits', () => {
+        strictEqual(toHex(fir({ ssrc: 0x11223344, mediaSsrc: 0xaabbccdd, seq: 300 })).slice(-8), '2c000000');
     });
 });

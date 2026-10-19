@@ -21,7 +21,7 @@ import {
 } from './negotiation.js';
 import { createContext } from './srtp.js';
 import { VideoAssembler } from './rtp-video.js';
-import { receiverReport, pictureAck, rateControl, keyRequest } from './feedback.js';
+import { receiverReport, pictureAck, rateControl } from './feedback.js';
 import { TierController } from './rate-tier.js';
 import { ReceiveStats } from './receive-stats.js';
 import { PAYLOAD_TYPE_HEVC, TIERS } from './offer-template.js';
@@ -894,11 +894,6 @@ export class HpSession {
         this.stats.pictures++;
         this._lastPictureAt = this._now();
         if (picture.key) this.stats.keyPictures++;
-        if (picture.key && this._keyProbe) {
-            this._warn('DIAG key probe: key picture ' + (this._now() - this._keyProbe.at) +
-                       ' ms after ' + this._keyProbe.what);
-            this._keyProbe = null;
-        }
         if (this._sink) this._sink.push(picture);
         if (this._feedback.acks) {
             this._sendRtcp(CHANNEL_VIDEO, pictureAck({
@@ -906,29 +901,6 @@ export class HpSession {
                 don: picture.don & 0xffff,
             }));
         }
-    }
-
-    // DIAGNOSTIC (temporary): ask the Mac for a key picture with a 'pli' or
-    // 'fir', alone or after a receiver report in one compound packet, and log
-    // how long the next key picture takes. False when not streaming.
-    requestKeyPicture(kind = 'pli', compound = true) {
-        if (this.state !== 'streaming' || !this._answer) return false;
-        const mediaSsrc = this._answer.video.ssrc;
-        this._firSeq = ((this._firSeq || 0) + 1) & 0xff;
-        const req = keyRequest({ ssrc: this._secrets.videoSsrc, mediaSsrc, kind, seq: this._firSeq });
-        const fields = compound ? this._recvStats.rrFields(mediaSsrc) : null;
-        let plain = req;
-        if (fields) {
-            const rr = receiverReport({ ssrc: this._secrets.videoSsrc, sourceSsrc: mediaSsrc, ...fields });
-            plain = new Uint8Array(rr.length + req.length);
-            plain.set(rr, 0);
-            plain.set(req, rr.length);
-        }
-        const what = kind + (fields ? ' (compound)' : '') + ' at ' + this.stats.keyPictures + ' key pictures';
-        this._keyProbe = { at: this._now(), what };
-        this._warn('DIAG key probe: sent ' + what);
-        this._sendRtcp(CHANNEL_VIDEO, plain);
-        return true;
     }
 
     // ----- media out -----

@@ -96,23 +96,34 @@ export function rateControl({ ssrc, a, b, c, d }) {
 }
 
 /**
- * DIAGNOSTIC (temporary): a key picture request, as RTCP payload-specific
- * feedback (PT=206). 'pli' is a Picture Loss Indication (RFC 4585, FMT 1,
- * 12 bytes); 'fir' a Full Intra Request (RFC 5104, FMT 4, 20 bytes) carrying
- * seq. Whether the Mac acts on either is what the probe finds out.
+ * A Picture Loss Indication: RTCP payload-specific feedback (PT=206, RFC 4585
+ * FMT 1), 12 bytes. Asks the media source to send a key picture.
  */
-export function keyRequest({ ssrc, mediaSsrc, kind = 'pli', seq = 0 }) {
-    const fir = kind === 'fir';
-    const out = new Uint8Array(fir ? 20 : 12);
+export function pli({ ssrc, mediaSsrc }) {
+    const out = new Uint8Array(12);
     const dv = new DataView(out.buffer);
 
-    dv.setUint32(0, fir ? 0x84ce0004 : 0x81ce0002, false);  // V=2, FMT 4|1, PT=206
+    dv.setUint32(0, 0x81ce0002, false);  // V=2, FMT 1, PT=206, length 2
     dv.setUint32(4, clamp(ssrc, U32), false);
-    dv.setUint32(8, fir ? 0 : clamp(mediaSsrc, U32), false);
-    if (fir) {
-        dv.setUint32(12, clamp(mediaSsrc, U32), false);
-        dv.setUint8(16, clamp(seq, U8));
-    }
+    dv.setUint32(8, clamp(mediaSsrc, U32), false);
+
+    return out;
+}
+
+/**
+ * A Full Intra Request: RTCP payload-specific feedback (PT=206, RFC 5104
+ * FMT 4), 20 bytes. The FCI names the media source and carries an 8-bit
+ * command sequence number (wraps modulo 256).
+ */
+export function fir({ ssrc, mediaSsrc, seq }) {
+    const out = new Uint8Array(20);
+    const dv = new DataView(out.buffer);
+
+    dv.setUint32(0, 0x84ce0004, false);  // V=2, FMT 4, PT=206, length 4
+    dv.setUint32(4, clamp(ssrc, U32), false);
+    dv.setUint32(8, 0, false);           // media source: unused, FCI names it
+    dv.setUint32(12, clamp(mediaSsrc, U32), false);
+    dv.setUint8(16, seq & 0xff);
 
     return out;
 }
