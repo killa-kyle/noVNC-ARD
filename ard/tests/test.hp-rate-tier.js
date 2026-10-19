@@ -18,7 +18,7 @@ function run(c, t, seconds, over = {}, step = 1000) {
 describe('HP tier controller', () => {
     it('starts at 16000 and caps the start by maxKbit', () => {
         assert.equal(new TierController({}).tier, 16000);
-        assert.equal(new TierController({ maxKbit: 9000 }).tier, 8000);
+        assert.equal(new TierController({ maxKbit: 13000 }).tier, 12000);
     });
 
     it('steps down on loss, delay and recovery to 0.75 x tier', () => {
@@ -31,7 +31,7 @@ describe('HP tier controller', () => {
 
     it('a limiting budget lowers the target to 0.85 x budget', () => {
         const c = new TierController({});
-        assert.equal(c.sample({ now: 1000, ...GOOD, budget: { kbit: 9000, limiting: true } }), 6000);
+        assert.equal(c.sample({ now: 1000, ...GOOD, budget: { kbit: 9000, limiting: true } }), 12000);
     });
 
     it('ignores a non-limiting budget', () => {
@@ -49,7 +49,8 @@ describe('HP tier controller', () => {
         const c = new TierController({});
         assert.equal(c.sample({ now: 1000, ...GOOD, lossPct: 5 }), 12000);
         assert.equal(c.sample({ now: 1000 + DOWN_MIN_GAP_MS - 1, ...GOOD, lossPct: 5 }), null);
-        assert.equal(c.sample({ now: 1000 + DOWN_MIN_GAP_MS, ...GOOD, lossPct: 5 }), 8000);
+        assert.equal(c.sample({ now: 1000 + DOWN_MIN_GAP_MS, ...GOOD, lossPct: 5 }), null);
+        assert.equal(c.tier, 12000);
     });
 
     it('steps up one tier after 30 s clean under load', () => {
@@ -118,25 +119,41 @@ describe('HP tier controller', () => {
     });
 
     it('resets the hold to 30 s after 10 minutes without a down trigger, mid-climb', () => {
-        const c = new TierController({ start: 8000 });
-        let r = run(c, 0, 1, { lossPct: 5 });          // 6000, hold 60
-        r = run(c, r.t, 60);                            // up to 8000
-        assert.equal(c.tier, 8000);
-        r = run(c, r.t, 1, { lossPct: 5 });             // 6000, hold 120
-        assert.equal(c.tier, 6000);
-        const T = r.t;
-        r = run(c, r.t, 300, { videoKbit: 100 });      // idle: no up
-        assert.equal(c.tier, 6000);
-        r = run(c, r.t, 299);                           // ups at T+320, +440, +560
-        assert.equal(r.t, T + 599000);
-        assert.equal(c.tier, 12000);
-        r = run(c, r.t, 21);                            // hold reset at T+600: up at once
+        const c = new TierController({ start: 16000 });
+        let r = run(c, 0, 1, { lossPct: 5 });          // 12000, hold 60
+        r = run(c, r.t, 60);                            // up to 16000
         assert.equal(c.tier, 16000);
+        r = run(c, r.t, 1, { lossPct: 5 });             // 12000, hold 120
+        assert.equal(c.tier, 12000);
+        const T = r.t;
+        r = run(c, r.t, 580, { videoKbit: 100 });      // idle: no up
+        assert.equal(c.tier, 12000);
+        r = run(c, r.t, 20);                            // hold reset at T+600: up at once
+        assert.equal(r.t, T + 600000);
+        assert.equal(c.tier, 16000);
+        r = run(c, r.t, 31);                            // and the next hold is 30 s, not 120
+        assert.equal(c.tier, 20000);
     });
 
-    it('snaps a start that is not a tier down, and a tiny cap to 4000', () => {
+    it('snaps a start that is not a tier down, and a tiny cap to 12000', () => {
         assert.equal(new TierController({ start: 14000 }).tier, 12000);
-        assert.equal(new TierController({ maxKbit: 3000 }).tier, 4000);
+        assert.equal(new TierController({ maxKbit: 3000 }).tier, 12000);
+    });
+
+    it('caps at 12000 when ardHpMaxKbit is below the lowest tier', () => {
+        const c = new TierController({ maxKbit: 8000 });
+        assert.equal(c.tier, 12000);
+        assert.equal(c.sample({ now: 1000, ...GOOD, lossPct: 9 }), null);
+        assert.equal(c.tier, 12000);
+        assert.deepEqual(run(c, 1000, 200).changes, [], 'the cap also holds the ceiling at 12000');
+    });
+
+    it('steps down 20000 -> 12000 -> stays', () => {
+        const c = new TierController({ start: 20000 });
+        assert.equal(c.sample({ now: 1000, ...GOOD, lossPct: 5 }), 12000);
+        assert.equal(c.sample({ now: 1000 + DOWN_MIN_GAP_MS, ...GOOD, lossPct: 5 }), null);
+        assert.equal(c.sample({ now: 1000 + 2 * DOWN_MIN_GAP_MS, ...GOOD, recovery: true }), null);
+        assert.equal(c.tier, 12000);
     });
 
     it('treats an invalid maxKbit as no cap', () => {
@@ -161,15 +178,15 @@ describe('HP tier controller', () => {
         assert.equal(c._loadMs, 1000);
     });
 
-    it('never exceeds the ceiling or maxKbit and never drops below 4000', () => {
+    it('never exceeds the ceiling or maxKbit and never drops below 12000', () => {
         const c = new TierController({ maxKbit: 12000 });
         assert.equal(c.tier, 12000);
         assert.deepEqual(run(c, 0, 200, { videoKbit: 12000 }).changes, []);
-        const d = new TierController({ start: 4000 });
+        const d = new TierController({ start: 12000 });
         assert.equal(d.sample({ now: 1000, ...GOOD, lossPct: 9 }), null);
-        assert.equal(d.tier, 4000);
+        assert.equal(d.tier, 12000);
         const e = new TierController({});
         e.sample({ now: 1000, ...GOOD, budget: { kbit: 100, limiting: true } });
-        assert.equal(e.tier, 4000);
+        assert.equal(e.tier, 12000);
     });
 });

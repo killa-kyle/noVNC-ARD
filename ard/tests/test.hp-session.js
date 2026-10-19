@@ -1194,10 +1194,10 @@ describe('High Performance session', () => {
     });
 
     it('offers the tier it is given, and the default without one', async () => {
-        await negotiate({ tier: 8000 });
-        strictEqual(session.tier, 8000);
+        await negotiate({ tier: 12000 });
+        strictEqual(session.tier, 12000);
         deepStrictEqual(await videoRatesFromOffer(offers[0]),
-            [2400000, 8000000, 16000000, 24000000, 30000000, 40000000]);
+            [3600000, 12000000, 24000000, 36000000, 45000000, 60000000]);
         session.close();
         await negotiate();
         strictEqual(session.tier, 16000);
@@ -1205,26 +1205,26 @@ describe('High Performance session', () => {
     });
 
     it('re-offers at a new tier while streaming', async () => {
-        await stream({ tier: 8000 });
-        strictEqual(session.setTier(12000), true);
-        strictEqual(session.tier, 12000);
+        await stream({ tier: 12000 });
+        strictEqual(session.setTier(16000), true);
+        strictEqual(session.tier, 16000);
         await until(() => offers.length === 2, 'the second offer');
         const rates = await videoRatesFromOffer(offers[1]);
-        ok(rates.includes(12000000));
-        ok(!rates.includes(8000000));
+        ok(rates.includes(16000000));
+        ok(!rates.includes(12000000));
         // A resize re-offer keeps the tier.
         session.close();
-        await stream({ tier: 6000 });
+        await stream({ tier: 12000 });
         session.reoffer();
         await until(() => offers.length === 2, 'the resize offer');
-        ok((await videoRatesFromOffer(offers[1])).includes(6000000));
+        ok((await videoRatesFromOffer(offers[1])).includes(12000000));
     });
 
     it('does not change tier when not streaming', async () => {
-        create({ tier: 8000 });
-        strictEqual(session.setTier(12000), false);
+        create({ tier: 12000 });
+        strictEqual(session.setTier(16000), false);
         strictEqual(offers.length, 0);
-        strictEqual(session.tier, 8000);
+        strictEqual(session.tier, 12000);
     });
 
     it('routes media to the new stream after a resize', async () => {
@@ -1514,25 +1514,25 @@ describe('High Performance session', () => {
         pass(5100);                          // no answer, and nothing more arrives
         await until(() => offers.length === 3, 'the recovery re-offer');
         strictEqual(session.state, 'streaming');
-        strictEqual(await tierOfOffer(offers[2]), 8000);
+        strictEqual(await tierOfOffer(offers[2]), 12000);
     });
 
-    it('keeps to one down in 4 s while the loss goes on', async () => {
+    it('stays at the lowest tier while the loss goes on', async () => {
         await lossDown();
         await answerReoffer();
-        // The new stream is lossy too, sampled every second; the last of
-        // these samples is past the grace but inside 4 s of the down.
+        // The new stream is lossy too, sampled every second, past the grace:
+        // at the lowest tier there is no further step.
         const feed2 = await videoFeed(keysFromOffer(offers[1]).video);
         for (let i = 0; i < 3; i++) {
             await feed2(3, 4);
             pass(1000);
             await settle();
         }
-        strictEqual(offers.length, 2, 'no down inside 4 s of the last');
         await feed2(3, 4);
         pass(1000);
-        await until(() => offers.length === 3, 'the next down');
-        strictEqual(await tierOfOffer(offers[2]), 8000);
+        await settle();
+        strictEqual(offers.length, 2, 'no down below the lowest tier');
+        strictEqual(session.tier, 12000);
     });
 
     it('sees no loss or delay in the start grace, on connect and after a swap', async () => {
@@ -1546,7 +1546,7 @@ describe('High Performance session', () => {
         }
         strictEqual(offers.length, 1);
         // A requested tier change; the new stream's start is lossy too.
-        strictEqual(session.setTier(12000), true);
+        strictEqual(session.setTier(20000), true);
         await until(() => offers.length === 2, 'the tier re-offer');
         await answerReoffer();
         const feed2 = await videoFeed(keysFromOffer(offers[1]).video);
@@ -1560,7 +1560,7 @@ describe('High Performance session', () => {
         await feed2(3, 4);
         pass(1000);
         await until(() => offers.length === 3, 'the down');
-        strictEqual(await tierOfOffer(offers[2]), 8000);
+        strictEqual(await tierOfOffer(offers[2]), 12000);
     });
 
     it('times packets by their arrival, not by when decryption finished', async () => {
@@ -1611,10 +1611,10 @@ describe('High Performance session', () => {
     });
 
     it('a resize re-offer carries the tier in force', async () => {
-        await stream({ tier: 8000 });
+        await stream({ tier: 20000 });
         session.reoffer();
         await until(() => offers.length === 2, 'the resize offer');
-        strictEqual(await tierOfOffer(offers[1]), 8000);
+        strictEqual(await tierOfOffer(offers[1]), 20000);
         session.close();
 
         await lossDown();
@@ -1651,25 +1651,25 @@ describe('High Performance session', () => {
     });
 
     it('carries the current tier in RCTL field D', async () => {
-        const keys = await stream({ tier: 10000 });
+        const keys = await stream({ tier: 20000 });
         const reader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
         ws.sent.length = 0;
         pass(50);
         await until(() => ws.sent.length >= 1, 'an RCTL report');
         const plain = await reader.unprotectRtcp(ws.sent[0].subarray(1));
         strictEqual(String.fromCharCode(...plain.subarray(8, 12)), 'RCTL');
-        strictEqual(new DataView(plain.buffer, plain.byteOffset).getUint16(30), 10000);
+        strictEqual(new DataView(plain.buffer, plain.byteOffset).getUint16(30), 20000);
     });
 
     it('starts at the tier stored for this Mac in the last day, capped by maxKbit', async () => {
         const stored = (tier, ageMs = 0) => JSON.stringify({ tier, at: Date.now() - ageMs });
         const storage = fakeStorage({
-            'ardHpTier:mac1': stored(10000),
+            'ardHpTier:mac1': stored(20000),
             'ardHpTier:mac3': stored(9999),
-            'ardHpTier:old': stored(10000, TIER_STORED_MAX_AGE_MS + 1),
-            'ardHpTier:ahead': stored(10000, -(TIER_STORED_MAX_AHEAD_MS + 1000)),
-            'ardHpTier:skewed': stored(10000, -(TIER_STORED_MAX_AHEAD_MS - 1000)),
-            'ardHpTier:legacy': '8000',
+            'ardHpTier:old': stored(20000, TIER_STORED_MAX_AGE_MS + 1),
+            'ardHpTier:ahead': stored(20000, -(TIER_STORED_MAX_AHEAD_MS + 1000)),
+            'ardHpTier:skewed': stored(20000, -(TIER_STORED_MAX_AHEAD_MS - 1000)),
+            'ardHpTier:legacy': '12000',
             'ardHpTier:junk': '{',
         });
         const startTier = async (extra) => {
@@ -1678,17 +1678,18 @@ describe('High Performance session', () => {
             session.close();
             return tier;
         };
-        strictEqual(await startTier({ tierKey: 'mac1' }), 10000);
-        strictEqual(await startTier({ tierKey: 'mac1', maxKbit: 6000 }), 6000);
+        strictEqual(await startTier({ tierKey: 'mac1' }), 20000);
+        strictEqual(await startTier({ tierKey: 'mac1', maxKbit: 16000 }), 16000);
+        strictEqual(await startTier({ tierKey: 'mac1', maxKbit: 6000 }), 12000, 'a cap below the ladder');
         strictEqual(await startTier({ tierKey: 'mac2' }), 16000, 'nothing stored');
         strictEqual(await startTier({ tierKey: 'mac3' }), 16000, 'not a tier');
         strictEqual(await startTier({ tierKey: 'old' }), 16000, 'older than a day');
         strictEqual(await startTier({ tierKey: 'ahead' }), 16000, 'from the future');
-        strictEqual(await startTier({ tierKey: 'skewed' }), 10000, 'a clock a little ahead');
-        strictEqual(await startTier({ tierKey: 'legacy' }), 8000, 'a bare number from an earlier build');
+        strictEqual(await startTier({ tierKey: 'skewed' }), 20000, 'a clock a little ahead');
+        strictEqual(await startTier({ tierKey: 'legacy' }), 12000, 'a bare number from an earlier build');
         strictEqual(await startTier({ tierKey: 'junk' }), 16000, 'not JSON');
         // An explicit start tier comes before the stored one.
-        strictEqual(await startTier({ tierKey: 'mac1', tier: 8000 }), 8000);
+        strictEqual(await startTier({ tierKey: 'mac1', tier: 12000 }), 12000);
         // Storage that refuses is no failure.
         const refusing = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } };
         strictEqual(await startTier({ tierKey: 'mac1', storage: refusing }), 16000);
@@ -1738,25 +1739,35 @@ describe('High Performance session', () => {
         mock.timers.tick(5000);
         await settle();
         strictEqual(session.state, 'failed');
-        deepStrictEqual(seen, [12000, 8000]);
+        deepStrictEqual(seen, [12000]);
         strictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')).tier, 16000);
+    });
+
+    it('ignores a stored tier that is no longer a tier', async () => {
+        const storage = fakeStorage({
+            'ardHpTier:mac1': JSON.stringify({ tier: 4000, at: Date.now() }),
+        });
+        await negotiate({ storage, tierKey: 'mac1' });
+        strictEqual(session.tier, 16000);
+        strictEqual(await tierOfOffer(offers[0]), 16000);
     });
 
     it('takes only known tiers, and none above the cap', async () => {
         create({ tier: 9999 });
         strictEqual(session.tier, 16000);
         session.close();
-        await stream({ maxKbit: 10000 });
-        strictEqual(session.tier, 10000);
+        await stream({ maxKbit: 16000 });
+        strictEqual(session.tier, 16000);
         strictEqual(session.setTier(9999), false);
         strictEqual(session.setTier(0), false);
-        strictEqual(session.setTier(12000), false);
+        strictEqual(session.setTier(4000), false, 'a tier that was dropped from the ladder');
+        strictEqual(session.setTier(20000), false);
         await settle();
-        strictEqual(session.tier, 10000);
+        strictEqual(session.tier, 16000);
         strictEqual(offers.length, 1);
-        strictEqual(session.setTier(6000), true);
+        strictEqual(session.setTier(12000), true);
         await until(() => offers.length === 2, 'the requested tier');
-        strictEqual(await tierOfOffer(offers[1]), 6000);
+        strictEqual(await tierOfOffer(offers[1]), 12000);
     });
 
     // ----- the agent's control frame -----
@@ -1797,8 +1808,8 @@ describe('High Performance session', () => {
         ws.deliver(2, controlFrame({ budgetKbit: 9000 }));
         pass(1000);
         await until(() => offers.length === 2, 'the tier re-offer');
-        strictEqual(session.tier, 6000);
-        strictEqual(await tierOfOffer(offers[1]), 6000);
+        strictEqual(session.tier, 12000);
+        strictEqual(await tierOfOffer(offers[1]), 12000);
     });
 
     it('takes an agent budget up to 3 s old and no older', async () => {
@@ -1814,7 +1825,7 @@ describe('High Performance session', () => {
             session.close();
             return tier;
         };
-        strictEqual(await sampledAt(2900), 6000);
+        strictEqual(await sampledAt(2900), 12000);
         strictEqual(await sampledAt(3100), 16000);
     });
 

@@ -215,11 +215,11 @@ describe('Offer (message 0x1c)', () => {
     it('is unchanged at the default tier', async () => {
         const s = fixedSecrets();
         strictEqual(DEFAULT_TIER, 20000);
-        deepStrictEqual(TIERS, [4000, 6000, 8000, 10000, 12000, 16000, 20000]);
+        deepStrictEqual(TIERS, [12000, 16000, 20000]);
         const plain = await buildOffer(s, { ntpTime });
         const tiered = await buildOffer(s, { ntpTime, tier: 20000 });
         deepStrictEqual(tiered, plain);
-        const other = await buildOffer(s, { ntpTime, tier: 8000 });
+        const other = await buildOffer(s, { ntpTime, tier: 12000 });
         ok(other.length !== plain.length || !other.every((b, i) => b === plain[i]));
     });
 
@@ -333,12 +333,21 @@ describe('Offer table tiers', () => {
         deepStrictEqual(tableFields(20000).map(f => f[0]), Array(10).fill(9));
     });
 
+    it('table for 12000 scales rows by 0.6', () => {
+        const r = rows(12000);
+        deepStrictEqual(r.slice(0, 4), base.slice(0, 4));
+        deepStrictEqual(r.slice(4).map(x => x[1]),
+            [3600000, 12000000, 24000000, 36000000, 45000000, 60000000]);
+        strictEqual(r.find(x => x[1] === 12000000)[0], 0);
+        ok(!r.some(x => x[1] === 20000000));
+    });
+
     it('scales the bit-rate rows to the tier and nothing else', () => {
-        const r = rows(8000);
+        const r = rows(16000);
         strictEqual(r.length, 10);
         deepStrictEqual(r.slice(0, 4), base.slice(0, 4));
         deepStrictEqual(r.slice(4).map(x => x[1]),
-            [2400000, 8000000, 16000000, 24000000, 30000000, 40000000]);
+            [4800000, 16000000, 32000000, 48000000, 60000000, 80000000]);
         deepStrictEqual(r.slice(4).map(x => x[2]), base.slice(4).map(x => x[2]));
         deepStrictEqual(r.slice(4).map(x => x[0]), Array(6).fill(0));
     });

@@ -43,8 +43,9 @@ const TABLE = [
 
 // Field 9 also sets the Mac's encoder bit rate: the rows with field 1 = 0 are
 // bit-rate steps in bit/s (field 2). They are tabulated for DEFAULT_TIER and
-// scale with the requested tier (kbit/s).
-export const TIERS = [4000, 6000, 8000, 10000, 12000, 16000, 20000];
+// scale with the requested tier (kbit/s). The Mac's encoder target never goes
+// below about 12 Mbit/s, so lower tiers would change nothing.
+export const TIERS = [12000, 16000, 20000];
 export const DEFAULT_TIER = 20000;
 
 export function tableFields(tier = DEFAULT_TIER) {
