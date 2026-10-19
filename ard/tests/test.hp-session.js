@@ -603,6 +603,38 @@ describe('High Performance session', () => {
         deepStrictEqual(kinds, { rctl: 20, videoReport: 1, audioReport: 1 });
     });
 
+    it('reports the loss and jitter it saw in the next receiver report', async () => {
+        const keys = await negotiate();
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        const videoReader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
+
+        // Sequence numbers 100, 101, then 106: four packets never arrive.
+        for (const [seq, frame] of [[100, 1], [101, 2], [106, 3]]) {
+            ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq, don: 5 + frame, frame })));
+            mock.timers.tick(7);
+        }
+        await until(() => session.stats.videoPackets === 3, 'three video packets');
+        sinks[0].opts.onFirstFrame();
+        ws.sent.length = 0;
+
+        for (let i = 0; i < 20; i++) {
+            mock.timers.tick(50);
+            await settle(4);
+        }
+        await until(() => ws.sent.length >= 21, 'rate reports and the video receiver report');
+        let block = null;
+        for (const msg of ws.sent) {
+            if (msg[0] !== CHANNEL_VIDEO) continue;
+            const plain = await videoReader.unprotectRtcp(msg.subarray(1));
+            if (plain[1] === 201) block = new DataView(plain.buffer, plain.byteOffset);
+        }
+        ok(block, 'a video receiver report was sent');
+        strictEqual(block.getUint32(8), SERVER_VIDEO_SSRC);
+        strictEqual(block.getUint8(12), Math.floor(4 * 256 / 7), 'fraction lost');
+        strictEqual(block.getUint32(12) & 0xffffff, 4, 'cumulative lost');
+        strictEqual(block.getUint32(16), 106);
+    });
+
     it('adapts rate-control field D to assembler loss and holds the ceiling when idle', async () => {
         const keys = await negotiate();
         const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);

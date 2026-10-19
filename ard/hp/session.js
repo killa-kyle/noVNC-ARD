@@ -20,7 +20,7 @@ import { createContext } from './srtp.js';
 import { VideoAssembler } from './rtp-video.js';
 import { receiverReport, pictureAck, rateControl } from './feedback.js';
 import { RateController, EVAL_MS } from './rate-control.js';
-import { extendSeq } from './seq.js';
+import { ReceiveStats } from './receive-stats.js';
 import { PAYLOAD_TYPE_HEVC, DEFAULT_TIER } from './offer-template.js';
 
 // WebSocket subprotocol a relay's media endpoint answers to.
@@ -87,23 +87,12 @@ const RECOVERY_MAX = 3;
 const RECOVERY_WINDOW_MS = 30000;
 const RECOVERABLE = new Set(['stalled', 'media-stopped', 'overloaded']);
 
+// RTP clock rates of the two streams, in units per second.
+const VIDEO_CLOCK = 90000;
+const AUDIO_CLOCK = 48000;
+
 function isRtcp(packet) {
     return packet.length > 1 && packet[1] >= 192 && packet[1] <= 223;
-}
-
-// Highest sequence number seen on one RTP stream, extended past 16 bits.
-class SeqTracker {
-    constructor() {
-        this.highest = null;
-    }
-
-    update(seq) {
-        if (this.highest === null) {
-            this.highest = seq;
-            return;
-        }
-        this.highest = Math.max(this.highest, extendSeq(this.highest, seq));
-    }
 }
 
 export class HpSession {
@@ -168,8 +157,7 @@ export class HpSession {
         this._timers = new Set();
         this._intervals = new Set();
         this._sendChain = [Promise.resolve(), Promise.resolve()];
-        this._audioSeq = new SeqTracker();
-        this._videoSeq = new SeqTracker();
+        this._recvStats = new ReceiveStats();
         this._lastVideoPacketAt = null;
         this._lastPictureAt = null;              // when a picture last completed
         this._lastMediaAt = null;                // last packet of either stream that verified
@@ -549,8 +537,7 @@ export class HpSession {
         // The old sink is kept until the new picture shows; hold it where
         // teardown can find it, so a close() in that window frees it too.
         this._resizeOldSink = (oldSink && oldSink !== sink) ? oldSink : null;
-        this._audioSeq = new SeqTracker();
-        this._videoSeq = new SeqTracker();
+        this._recvStats = new ReceiveStats();
         this._lastSenderReport = [null, null];
         // The new stream starts now: give the silence watchdogs a fresh
         // window so the gap of the mode switch does not trip them.
@@ -680,7 +667,10 @@ export class HpSession {
             if (channel === CHANNEL_AUDIO) {
                 this.stats.audioPackets++;
                 this.stats.audioBytes += rtp.payload.length;
-                this._audioSeq.update(rtp.seq);
+                this._recvStats.onPacket({
+                    ssrc: rtp.ssrc, seq: rtp.seq, rtpTs: rtp.timestamp, clockRate: AUDIO_CLOCK,
+                    bytes: rtp.payload.length, now: this._lastMediaAt, video: false,
+                });
                 if (this._audio) this._audio.push(rtp);
                 return;
             }
@@ -693,7 +683,10 @@ export class HpSession {
             this.stats.videoPackets++;
             this.stats.videoBytes += rtp.payload.length;
             this._lastVideoPacketAt = this._now();
-            if (rtp.ssrc === this._answer.video.ssrc) this._videoSeq.update(rtp.seq);
+            this._recvStats.onPacket({
+                ssrc: rtp.ssrc, seq: rtp.seq, rtpTs: rtp.timestamp, clockRate: VIDEO_CLOCK,
+                bytes: rtp.payload.length, now: this._lastVideoPacketAt, video: true,
+            });
             this._assembler.push(rtp, this._now());
         }, () => {
             this._decrypting--;
@@ -785,18 +778,19 @@ export class HpSession {
     _sendReports() {
         if (!this._feedback.reports) return;
         const now = this._now();
-        const report = (channel, ssrc, sourceSsrc, tracker) => {
-            if (tracker.highest === null) return;
+        const report = (channel, ssrc, sourceSsrc) => {
+            const fields = this._recvStats.rrFields(sourceSsrc);
+            if (!fields) return;
             const sr = this._lastSenderReport[channel];
             this._sendRtcp(channel, receiverReport({
                 ssrc,
                 sourceSsrc,
-                highestSeq: tracker.highest,
+                ...fields,
                 lsr: sr ? sr.middle : 0,
                 dlsr: sr ? Math.round((now - sr.at) * 65.536) : 0,
             }));
         };
-        report(CHANNEL_AUDIO, this._secrets.audioSsrc, this._answer.audio.ssrc, this._audioSeq);
-        report(CHANNEL_VIDEO, this._secrets.videoSsrc, this._answer.video.ssrc, this._videoSeq);
+        report(CHANNEL_AUDIO, this._secrets.audioSsrc, this._answer.audio.ssrc);
+        report(CHANNEL_VIDEO, this._secrets.videoSsrc, this._answer.video.ssrc);
     }
 }
