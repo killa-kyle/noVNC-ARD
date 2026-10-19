@@ -12,9 +12,9 @@
  * BUDGET_TARGET x budget), at most one per DOWN_MIN_GAP_MS.
  * Up: one step after UP_HOLD_MS with no trigger and loss < UP_LOSS_PCT, with
  * video at least UP_LOAD_FRACTION x tier for UP_LOAD_SECONDS of that time
- * (an idle screen proves nothing), unless a limiting budget is under
- * BUDGET_UP x the next tier. Each down doubles the hold; UP_RESET_MS of
- * calm resets it.
+ * (an idle screen proves nothing), and only while the agent budget is absent
+ * or not limiting. Each down doubles the hold; UP_RESET_MS without a down
+ * trigger resets it.
  */
 
 import { TIERS, DEFAULT_TIER } from './offer-template.js';
@@ -29,7 +29,6 @@ export const UP_LOAD_FRACTION = 0.7;
 export const UP_LOAD_SECONDS = 20;
 export const BUDGET_DOWN = 0.9;
 export const BUDGET_TARGET = 0.85;
-export const BUDGET_UP = 1.4;
 
 const DOWN_FACTOR = 0.75;
 // A sample gap longer than this credits no more load time than this, so a
@@ -47,10 +46,12 @@ function floorTier(kbit) {
 
 export class TierController {
     constructor({ start = 16000, maxKbit = null } = {}) {
-        this._ceiling = maxKbit === null ? DEFAULT_TIER : Math.min(DEFAULT_TIER, floorTier(maxKbit));
-        this._tier = Math.min(floorTier(start), this._ceiling);
+        const capped = Number.isFinite(maxKbit) && maxKbit > 0;
+        this._ceiling = capped ? Math.min(DEFAULT_TIER, floorTier(maxKbit)) : DEFAULT_TIER;
+        this._tier = Math.min(floorTier(Number.isFinite(start) ? start : 16000), this._ceiling);
         this._holdIdx = 0;
         this._lastDownAt = null;
+        this._lastTriggerAt = null; // last down trigger (not reset by an up)
         this._windowStart = null;   // start of the current trigger-free window
         this._lastNow = null;
         this._loadMs = 0;           // loaded time inside the window
@@ -60,19 +61,22 @@ export class TierController {
 
     sample({ now, lossPct, queueDelayMs, videoKbit, budget = null, recovery = false }) {
         const dt = this._lastNow === null ? 0 : Math.min(Math.max(now - this._lastNow, 0), MAX_CREDIT_MS);
-        this._lastNow = now;
+        if (this._lastNow === null || now >= this._lastNow) this._lastNow = now;
         if (this._windowStart === null) this._windowStart = now;
+        if (this._lastTriggerAt === null) this._lastTriggerAt = now;
 
         const limiting = budget !== null && budget.limiting === true;
-        const budgetTrips = limiting && budget.kbit < BUDGET_DOWN * this._tier;
+        const budgetKbit = limiting && Number.isFinite(budget.kbit) ? budget.kbit : null;
+        const budgetTrips = budgetKbit !== null && budgetKbit < BUDGET_DOWN * this._tier;
         const trigger = budgetTrips || recovery ||
             lossPct > DOWN_LOSS_PCT || queueDelayMs > DOWN_DELAY_MS;
 
         if (trigger) {
+            this._lastTriggerAt = now;
             this._restartWindow(now);
             if (this._lastDownAt !== null && now - this._lastDownAt < DOWN_MIN_GAP_MS) return null;
             let target = DOWN_FACTOR * this._tier;
-            if (limiting) target = Math.min(target, BUDGET_TARGET * budget.kbit);
+            if (budgetKbit !== null) target = Math.min(target, BUDGET_TARGET * budgetKbit);
             const next = Math.min(floorTier(target), this._tier);
             if (next === this._tier) return null;
             this._tier = next;
@@ -81,20 +85,21 @@ export class TierController {
             return next;
         }
 
-        if (lossPct >= UP_LOSS_PCT) {
+        // Missing or non-finite measurements are not evidence of a clean path.
+        if (!Number.isFinite(lossPct) || !Number.isFinite(queueDelayMs) || lossPct >= UP_LOSS_PCT) {
             this._restartWindow(now);
             return null;
         }
 
-        if (now - this._windowStart >= UP_RESET_MS) this._holdIdx = 0;
-        if (videoKbit >= UP_LOAD_FRACTION * this._tier) this._loadMs += dt;
+        if (now - this._lastTriggerAt >= UP_RESET_MS) this._holdIdx = 0;
+        if (Number.isFinite(videoKbit) && videoKbit >= UP_LOAD_FRACTION * this._tier) this._loadMs += dt;
 
         const idx = TIERS.indexOf(this._tier);
         const next = TIERS[idx + 1];
         if (next === undefined || next > this._ceiling) return null;
         if (now - this._windowStart < UP_HOLD_MS[this._holdIdx]) return null;
         if (this._loadMs < UP_LOAD_SECONDS * 1000) return null;
-        if (limiting && budget.kbit < BUDGET_UP * next) return null;
+        if (limiting) return null;
 
         this._tier = next;
         this._windowStart = now;
