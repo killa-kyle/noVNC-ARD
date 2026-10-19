@@ -16,7 +16,7 @@ import { deflate } from '../hp/zlib.js';
 import { createContext } from '../hp/srtp.js';
 import { splitKeyBlock } from '../hp/negotiation.js';
 import { pictureAck } from '../hp/feedback.js';
-import { HpSession, CHANNEL_AUDIO, CHANNEL_VIDEO } from '../hp/session.js';
+import { HpSession, CHANNEL_AUDIO, CHANNEL_VIDEO, hpFailureKeepsSession } from '../hp/session.js';
 import { codecFromAnnexB, splitAnnexB, DEFAULT_CODEC } from '../hp/hevc.js';
 import { overlayGeometry } from '../hp/video-sink.js';
 
@@ -382,6 +382,50 @@ describe('High Performance session', () => {
         ws.open();
         mock.timers.tick(5000);
         deepStrictEqual(states, ['failed:no-message1']);
+    });
+
+    // 1010 kind 3, errorType 1 / subcode 1: the Mac already streams High
+    // Performance to another viewer. It comes right after SetEncodings,
+    // before Message 1, so there is nothing to wait for.
+    const IN_USE = new Uint8Array([
+        0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01]);
+
+    it('stops at once when the Mac says another session has it', () => {
+        create();
+        ws.open();
+        session.handleAnswer(IN_USE);
+        deepStrictEqual(states, ['failed:in-use']);
+        strictEqual(session.failure, 'in-use: error 1/1');
+        ok(ws.closed);
+        // The Message 1 timer does not fire a second failure.
+        mock.timers.tick(5000);
+        deepStrictEqual(states, ['failed:in-use']);
+    });
+
+    it('takes the refusal before the media channel is open', () => {
+        create();
+        session.handleAnswer(IN_USE);
+        deepStrictEqual(states, ['failed:in-use']);
+    });
+
+    it('reports a refusal it does not know as refused', () => {
+        create();
+        ws.open();
+        const other = IN_USE.slice();
+        other[17] = 2;
+        session.handleAnswer(other);
+        deepStrictEqual(states, ['failed:refused']);
+        strictEqual(session.failure, 'refused: error 1/2');
+    });
+
+    it('keeps the session only when the Mac never negotiated', () => {
+        ok(hpFailureKeepsSession('no-message1'));
+        ok(hpFailureKeepsSession('in-use'));
+        ok(hpFailureKeepsSession('refused'));
+        ok(!hpFailureKeepsSession('no-answer'));
+        ok(!hpFailureKeepsSession('stalled'));
+        ok(!hpFailureKeepsSession(null));
     });
 
     it('fails on a malformed Message 1', () => {

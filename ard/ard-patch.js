@@ -36,7 +36,7 @@ import { parseDisplayInfo2, setDisplayBytes, displayRole,
          reconcileSelection } from './display-info.js';
 import { sessionCommand, sessionSelectAction } from './session-select.js';
 import { ardKeysym } from './keysyms.js';
-import { HpSession } from './hp/session.js';
+import { HpSession, hpFailureKeepsSession } from './hp/session.js';
 import { VideoSink } from './hp/video-sink.js';
 import { buildVirtualDisplayMessage, virtualDisplayFor } from './hp/virtual-display.js';
 import { offersHighPerformance } from './hp/capability.js';
@@ -1725,10 +1725,11 @@ RFB.prototype._ardHpOnState = function (state, reason) {
         // Not again on this connection.
         this._ardHpFailed = true;
         this._ardHp = null;
-        // The server never opened the negotiation, so this is an ordinary
-        // session: carry on in it. Any later failure leaves the server in a
-        // state not yet understood; the page reconnects.
-        if (reason === 'no-message1' && this._rfbConnectionState === 'connected') {
+        // The server never opened the negotiation (no Message 1, or it
+        // refused the mode), so this is an ordinary session: carry on in it.
+        // Any later failure leaves the server in a state not yet understood;
+        // the page reconnects.
+        if (hpFailureKeepsSession(reason) && this._rfbConnectionState === 'connected') {
             this._ardQualitySwitch();
         }
     }

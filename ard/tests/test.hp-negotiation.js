@@ -12,7 +12,7 @@ import * as protobuf from '../hp/protobuf.js';
 import * as plist from '../hp/plist.js';
 import { deflate, inflate } from '../hp/zlib.js';
 import {
-    parseMessage1, generateSecrets, splitKeyBlock, buildOffer, parseAnswer, parseStreamPorts,
+    parseMessage1, generateSecrets, splitKeyBlock, buildOffer, parseAnswer, parseStreamPorts, parseStreamError,
     ntpFromUnixMs, KEY_BLOCK_LENGTH,
 } from '../hp/negotiation.js';
 
@@ -278,5 +278,31 @@ describe('Stream ports notice', () => {
         strictEqual(parseStreamPorts(answer), null);
         strictEqual(parseStreamPorts(new Uint8Array([0])), null);
         strictEqual(parseStreamPorts(NOTICE.subarray(0, 12)), null);
+    });
+});
+
+// The same rectangle, kind 3: the server refuses the mode. Captured from a
+// Mac that already had a High Performance session for another viewer; it
+// came right after the client's SetEncodings, before any offer.
+describe('Stream error', () => {
+    const IN_USE = new Uint8Array([
+        0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01]);
+    const NOTICE = new Uint8Array([
+        0x00, 0x24, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x17, 0x0c, 0x00, 0x00, 0x00, 0x01,
+        0x17, 0x0d, 0x00, 0x00, 0x00, 0x01, ...new Array(16).fill(0)]);
+
+    it('reads the error type and subcode', () => {
+        deepStrictEqual(parseStreamError(IN_USE), { type: 1, subCode: 1 });
+    });
+
+    it('is not taken for the ports notice, nor the notice for it', () => {
+        strictEqual(parseStreamPorts(IN_USE), null);
+        strictEqual(parseStreamError(NOTICE), null);
+    });
+
+    it('rejects a truncated error', () => {
+        strictEqual(parseStreamError(IN_USE.subarray(0, 14)), null);
+        strictEqual(parseStreamError(new Uint8Array([0])), null);
     });
 });

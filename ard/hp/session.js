@@ -12,7 +12,10 @@
  * UDP datagram.
  */
 
-import { parseMessage1, generateSecrets, buildOffer, parseAnswer, splitKeyBlock, parseStreamPorts } from './negotiation.js';
+import {
+    parseMessage1, generateSecrets, buildOffer, parseAnswer, splitKeyBlock, parseStreamPorts,
+    parseStreamError, STREAM_ERROR_IN_USE,
+} from './negotiation.js';
 import { createContext } from './srtp.js';
 import { VideoAssembler } from './rtp-video.js';
 import { receiverReport, pictureAck, rateControl } from './feedback.js';
@@ -25,6 +28,18 @@ export const MEDIA_SUBPROTOCOL = 'ard-media';
 
 export const CHANNEL_AUDIO = 0;
 export const CHANNEL_VIDEO = 1;
+
+/*
+ * Whether the RFB connection carries on (in Standard) after a failure with
+ * this reason. Only when the server never opened the negotiation: it did not
+ * send Message 1, or it refused the mode outright. Any later failure leaves
+ * the server in a state nobody has mapped, so the viewer reconnects.
+ */
+const KEEPS_SESSION = new Set(['no-message1', 'in-use', 'refused']);
+
+export function hpFailureKeepsSession(reason) {
+    return KEEPS_SESSION.has(reason);
+}
 
 const MEDIA_CONNECT_MS = 3000;
 const MESSAGE1_MS = 5000;
@@ -348,6 +363,15 @@ export class HpSession {
         const ports = parseStreamPorts(payload);
         if (ports) {
             this._log('server ports: audio ' + ports.audioPort + ', video ' + ports.videoPort);
+            return;
+        }
+        // Or the server's refusal, which can come before Message 1: nothing
+        // more will follow, so stop now rather than wait for a timeout.
+        const error = parseStreamError(payload);
+        if (error) {
+            const inUse = error.type === STREAM_ERROR_IN_USE.type &&
+                error.subCode === STREAM_ERROR_IN_USE.subCode;
+            this._fail(inUse ? 'in-use' : 'refused', 'error ' + error.type + '/' + error.subCode);
             return;
         }
         // A re-offer sent during a session (a resize): swap the stream in

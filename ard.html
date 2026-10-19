@@ -43,7 +43,7 @@
         import { encodingArdHalftone, encodingArdGray16, encodingArdThousands } from './ard/ard-constants.js';
         import { displayMenuEntries } from './ard/display-info.js';
         import { VideoSink } from './ard/hp/video-sink.js';
-        import { MEDIA_SUBPROTOCOL } from './ard/hp/session.js';
+        import { MEDIA_SUBPROTOCOL, hpFailureKeepsSession } from './ard/hp/session.js';
         import { parseDisplayRequest } from './ard/hp/virtual-display.js';
         import { reconnectDelay } from './ard/reconnect-delay.js';
 
@@ -428,6 +428,8 @@
             'stalled': 'part of the picture was lost',
             'bad-message1': 'the Mac sent something unexpected',
             'bad-answer': 'the Mac sent something unexpected',
+            'in-use': 'another viewer already has a High Performance session on this Mac',
+            'refused': 'the Mac refused it',
         };
 
         // Put the current choice into effect on the connection being made.
@@ -478,13 +480,19 @@
             } else if (d.state === 'failed') {
                 const why = ardHpFailureText[d.reason] || d.reason;
                 Log.Warn('ARD: High Performance failed (' + d.failure + ')');
-                ardNotice('High Performance stopped: ' + why + '. Using Standard.', 'warn', 8000);
+                if (d.reason === 'in-use') {
+                    // Only one High Performance session per Mac: say so plainly.
+                    ardNotice((UI.desktopName || 'This Mac') + ' already has an active High Performance ' +
+                              'session. This session is using Standard.', 'warn', 10000);
+                } else {
+                    ardNotice('High Performance stopped: ' + why + '. Using Standard.', 'warn', 8000);
+                }
                 ardHpDisabled = true;
                 ardHpAttempt = null;
                 ardHpUiReset();
                 // The Mac never started the negotiation: the session is an
                 // ordinary one and carries on. Otherwise start again without.
-                if (d.reason !== 'no-message1' && UI.rfb) {
+                if (!hpFailureKeepsSession(d.reason) && UI.rfb) {
                     UI.rfb.disconnect();
                 }
             } else if (d.state === 'closed') {

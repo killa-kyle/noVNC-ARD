@@ -217,6 +217,37 @@ export function parseStreamPorts(payload) {
 }
 
 /*
+ * The same rectangle when the server refuses the mode (kind 3). Seen right
+ * after the client's SetEncodings, before Message 1, from a Mac that was
+ * already streaming High Performance to another viewer (errorType 1,
+ * subcode 1, as the server logs them):
+ *
+ *   0    2   length of what follows (16)
+ *   2    2   3
+ *   4    2   1
+ *   6    4   0
+ *  10    4   error type
+ *  14    4   error subcode
+ *
+ * Returns { type, subCode }, or null when `payload` is not one.
+ */
+const KIND_ERROR = 3;
+
+export function parseStreamError(payload) {
+    if (payload.length < 2) return null;
+    const length = u16(payload, 0);
+    if (length < 16 || payload.length < 2 + length) return null;
+    if (u16(payload, 2) !== KIND_ERROR) return null;
+    return {
+        type: (u16(payload, 10) << 16 | u16(payload, 12)) >>> 0,
+        subCode: (u16(payload, 14) << 16 | u16(payload, 16)) >>> 0,
+    };
+}
+
+/* errorType / subcode the server sends when another viewer has the mode. */
+export const STREAM_ERROR_IN_USE = Object.freeze({ type: 1, subCode: 1 });
+
+/*
  * The answer. `payload` is the rectangle's payload, starting with its
  * 16-bit length. Resolves to the server's SSRCs and the picture size.
  */
