@@ -7,7 +7,7 @@
 import { describe, it } from 'node:test';
 import { deepStrictEqual, strictEqual, ok } from 'node:assert';
 
-import { receiverReport, pictureAck, rateControl } from '../hp/feedback.js';
+import { receiverReport, pictureAck, rateControl, keyRequest } from '../hp/feedback.js';
 
 // Helper: hex string → Uint8Array
 function hex(s) {
@@ -221,5 +221,16 @@ describe('rateControl', () => {
     it('floors fractional values', () => {
         const out = rateControl({ ssrc: 1.5, a: 17.9, b: 49.99, c: 130.2, d: 59999.5 });
         deepStrictEqual(out, rateControl({ ssrc: 1, a: 17, b: 49, c: 130, d: 59999 }));
+    });
+});
+
+describe('keyRequest (diagnostic)', () => {
+    it('builds a PLI naming the media source', () => {
+        strictEqual(toHex(keyRequest({ ssrc: 0x11223344, mediaSsrc: 0xaabbccdd, kind: 'pli' })),
+                    '81ce0002' + '11223344' + 'aabbccdd');
+    });
+    it('builds a FIR with the source and sequence in its FCI', () => {
+        strictEqual(toHex(keyRequest({ ssrc: 0x11223344, mediaSsrc: 0xaabbccdd, kind: 'fir', seq: 7 })),
+                    '84ce0004' + '11223344' + '00000000' + 'aabbccdd' + '07000000');
     });
 });
