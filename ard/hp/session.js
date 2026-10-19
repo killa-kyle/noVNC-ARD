@@ -30,26 +30,6 @@ export const CHANNEL_AUDIO = 0;
 export const CHANNEL_VIDEO = 1;
 
 /*
- * TEMPORARY rate-probe diagnostic (2026-10-18). localStorage 'ardHpDiag' =
- * {"d": kbit} pins RCTL field D; {"loss": percent} makes receiver reports
- * claim that loss. Answers whether the Mac's encoder obeys D and reacts to
- * reported loss, before the HP transport redesign. Remove with that work.
- */
-function readHpDiag() {
-    try {
-        const raw = globalThis.localStorage && globalThis.localStorage.getItem('ardHpDiag');
-        if (!raw) return null;
-        const v = JSON.parse(raw);
-        const d = Number.isFinite(v.d) ? Math.max(1, Math.min(0xffff, Math.round(v.d))) : null;
-        const loss = Number.isFinite(v.loss) ? Math.max(0, Math.min(100, v.loss)) : null;
-        const tiers = Array.isArray(v.tiers) && v.tiers.length ? v.tiers.map(Number) : null;
-        return d === null && loss === null && tiers === null ? null : { d, loss, tiers };
-    } catch (e) {
-        return null;
-    }
-}
-
-/*
  * Whether the RFB connection carries on (in Standard) after a failure with
  * this reason. Only when the server never opened the negotiation: it did not
  * send Message 1, or it refused the mode outright. Any later failure leaves
@@ -160,8 +140,6 @@ export class HpSession {
         this._now = now || (() => performance.now());
         this._log = log || (() => {});
         this._warn = warn || this._log;
-        this._diag = readHpDiag();
-        if (this._diag) this._warn('ARD HP diag active: ' + JSON.stringify(this._diag));
 
         this.state = 'idle';
         this.failure = null;
@@ -789,7 +767,7 @@ export class HpSession {
             a: this.stats.pictures & 0xffff,
             b: sinceLast,
             c: this.stats.videoPackets,
-            d: this._diag && this._diag.d !== null ? this._diag.d : this._rateController.estimate(),
+            d: this._rateController.estimate(),
         }));
     }
 
@@ -799,13 +777,10 @@ export class HpSession {
         const report = (channel, ssrc, sourceSsrc, tracker) => {
             if (tracker.highest === null) return;
             const sr = this._lastSenderReport[channel];
-            const loss = this._diag && this._diag.loss !== null ? this._diag.loss / 100 : 0;
             this._sendRtcp(channel, receiverReport({
                 ssrc,
                 sourceSsrc,
                 highestSeq: tracker.highest,
-                fractionLost: Math.round(loss * 256) > 255 ? 255 : Math.round(loss * 256),
-                cumulativeLost: Math.round((tracker.highest & 0xffff) * loss),
                 lsr: sr ? sr.middle : 0,
                 dlsr: sr ? Math.round((now - sr.at) * 65.536) : 0,
             }));
