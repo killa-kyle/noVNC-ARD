@@ -42,7 +42,8 @@ function readHpDiag() {
         const v = JSON.parse(raw);
         const d = Number.isFinite(v.d) ? Math.max(1, Math.min(0xffff, Math.round(v.d))) : null;
         const loss = Number.isFinite(v.loss) ? Math.max(0, Math.min(100, v.loss)) : null;
-        return d === null && loss === null ? null : { d, loss };
+        const tiers = Array.isArray(v.tiers) && v.tiers.length ? v.tiers.map(Number) : null;
+        return d === null && loss === null && tiers === null ? null : { d, loss, tiers };
     } catch (e) {
         return null;
     }

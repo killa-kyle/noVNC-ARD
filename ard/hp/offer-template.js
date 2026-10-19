@@ -41,8 +41,23 @@ const TABLE = [
     [0, 100000000, 1048576],
 ];
 
+// TEMPORARY rate-probe diagnostic (2026-10-18): localStorage 'ardHpDiag'
+// {"tiers": [bit/s, ...]} keeps only those bit-rate rows (field 1 = 0) in
+// the offer table, to learn whether the table sets the encoder's target.
+function diagTiers() {
+    try {
+        const raw = globalThis.localStorage && globalThis.localStorage.getItem('ardHpDiag');
+        const v = raw ? JSON.parse(raw) : null;
+        return v && Array.isArray(v.tiers) && v.tiers.length ? v.tiers.map(Number) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 function tableFields() {
-    return TABLE.map(row => [9, row.map((value, i) => [i + 1, value])]);
+    const tiers = diagTiers();
+    const rows = tiers ? TABLE.filter(row => row[0] !== 0 || tiers.includes(row[1])) : TABLE;
+    return rows.map(row => [9, row.map((value, i) => [i + 1, value])]);
 }
 
 function payloadEntry(payloadType, variants, features, last) {
