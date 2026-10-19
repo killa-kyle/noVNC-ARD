@@ -6,12 +6,18 @@
  */
 
 import { describe, it } from 'node:test';
-import { strictEqual, ok } from 'node:assert';
+import { strictEqual, ok, deepStrictEqual } from 'node:assert';
 
-import { ReceiveStats } from '../hp/receive-stats.js';
+import { ReceiveStats, DELAY_MIN_SAMPLES } from '../hp/receive-stats.js';
+import { TierController, DOWN_DELAY_MS } from '../hp/rate-tier.js';
 
 const VIDEO = 90000;
 const SSRC = 0x1234;
+// 60 pictures a second: RTP time 1500 apart at 90 kHz.
+const PICTURE_TS = 1500;
+const PICTURE_MS = 1000 / 60;
+// Steady transit of the baseline.
+const TRANSIT_MS = 30;
 
 // Feed `count` packets from `first`, `stepMs` apart, skipping `missing`.
 function feed(stats, { first = 0, count, missing = [], t0 = 0, stepMs = 10, ssrc = SSRC,
@@ -23,6 +29,29 @@ function feed(stats, { first = 0, count, missing = [], t0 = 0, stepMs = 10, ssrc
             now: t0 + i * stepMs + extraMs(i), video,
         });
     }
+}
+
+// Sends picture `n` (RTP time n x PICTURE_TS) on one SSRC: `packets`
+// packets from `at`, `spreadMs` apart.
+function pictureSender(stats, ssrc = SSRC) {
+    let seq = 0;
+    return (n, at, packets = 1, spreadMs = 1) => {
+        for (let k = 0; k < packets; k++) {
+            stats.onPacket({ ssrc, seq: seq++ & 0xffff, rtpTs: (n * PICTURE_TS) >>> 0, clockRate: VIDEO,
+                             bytes: 1000, now: at + k * spreadMs, video: true });
+        }
+    };
+}
+
+// When picture `n` would arrive with no queue at all.
+const onTime = n => n * PICTURE_MS + TRANSIT_MS;
+
+// Samples the controller from the window at `now`; collects its changes.
+function sampleInto(ctl, stats, now, changes) {
+    const w = stats.window(now);
+    const r = ctl.sample({ now, ...w, videoKbit: 20000 });
+    if (r !== null) changes.push(r);
+    return w;
 }
 
 describe('ReceiveStats receiver report fields', () => {
@@ -114,39 +143,105 @@ describe('ReceiveStats window', () => {
         strictEqual(stats.window(5000).videoKbit, 0);
     });
 
-    it('reads queuing delay above the 10 s baseline', () => {
+    it('reads a standing queuing delay above the 10 s baseline', () => {
         const stats = new ReceiveStats();
         feed(stats, { count: 1000, stepMs: 10, extraMs: () => 30 });   // 10 s at a steady 30 ms transit
-        feed(stats, { first: 1000, count: 1, stepMs: 10, extraMs: () => 230 });
-        const w = stats.window(10010 + 230);
+        feed(stats, { first: 1000, count: 150, stepMs: 10, extraMs: () => 230 });
+        const w = stats.window(11490 + 230);
         ok(Math.abs(w.queueDelayMs - 200) < 1, 'about 200, got ' + w.queueDelayMs);
         strictEqual(stats.window(20000).queueDelayMs, 0);
     });
 
-    it('takes delay once per picture: a large frame spread over 300 ms is not queuing', () => {
+    it('takes delay once per picture, and needs several pictures in the last second', () => {
         const stats = new ReceiveStats();
-        // 60 pictures/s, one packet each, steady 30 ms transit.
-        let seq = 0;
-        for (let i = 0; i < 600; i++) {
-            stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: i * 1500, clockRate: VIDEO, bytes: 1000,
-                             now: i * 1000 / 60 + 30, video: true });
+        const send = pictureSender(stats);
+        for (let n = 0; n < 600; n++) send(n, onTime(n));
+        // An idle screen for 1.5 s, then a key picture of 300 packets, all
+        // one RTP time, arriving 200 ms late over 300 ms: one sample, not 300.
+        const late = n => onTime(n) + 200;
+        send(690, late(690), 300, 1);
+        strictEqual(stats.window(late(690) + 300).queueDelayMs, 0);
+        // Late packets of older pictures are no delay samples either.
+        for (let n = 686; n < 690; n++) send(n, late(690) + 300 + (n - 685));
+        strictEqual(stats.window(late(690) + 305).queueDelayMs, 0);
+        // New pictures are; with DELAY_MIN_SAMPLES of them the delay shows.
+        for (let n = 691; n < 690 + DELAY_MIN_SAMPLES - 1; n++) send(n, late(n));
+        strictEqual(stats.window(late(690 + DELAY_MIN_SAMPLES - 2)).queueDelayMs, 0);
+        const last = 690 + DELAY_MIN_SAMPLES - 1;
+        send(last, late(last));
+        ok(Math.abs(stats.window(late(last)).queueDelayMs - 200) < 1);
+    });
+
+    it('a large picture and the pictures queued behind it are no reason to step down', () => {
+        const stats = new ReceiveStats();
+        const send = pictureSender(stats);
+        const ctl = new TierController({});
+        const changes = [];
+        for (let n = 0; n < 600; n++) send(n, onTime(n));
+        // Picture 600 is 300 packets the Mac sends over 300 ms; the 60 per
+        // second after it wait until it is out, then go 1 ms apart.
+        let free = onTime(600);
+        send(600, free, 300, 1);
+        free += 300;
+        let worstPicture = 0, worst = 0;
+        for (let n = 601; n < 720; n++) {
+            const at = Math.max(onTime(n), free);
+            free = at + 1;
+            send(n, at);
+            worstPicture = Math.max(worstPicture, at - onTime(n));
+            worst = Math.max(worst, sampleInto(ctl, stats, at, changes).queueDelayMs);
         }
-        // A key picture of 300 packets, all one RTP time, arriving over 300 ms.
-        const ts = 600 * 1500;
-        const start = 600 * 1000 / 60 + 30;
-        for (let k = 0; k < 300; k++) {
-            stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: ts, clockRate: VIDEO, bytes: 1000,
-                             now: start + k, video: true });
+        ok(worstPicture > DOWN_DELAY_MS, 'pictures behind it are late, ' + worstPicture + ' ms');
+        ok(worst < 1, 'no standing queue, got ' + worst);
+        strictEqual(changes.length, 0);
+        strictEqual(ctl.tier, 16000);
+    });
+
+    it('a large picture over four stripes is no reason to step down', () => {
+        const stats = new ReceiveStats();
+        const sends = [1, 2, 3, 4].map(ssrc => pictureSender(stats, ssrc));
+        const ctl = new TierController({});
+        const changes = [];
+        for (let n = 0; n < 600; n++) sends.forEach((send, s) => send(n, onTime(n) + s * 0.5));
+        // Picture 600 on every stripe, one stripe after another, 75 ms each:
+        // the last stripe's first packet is 225 ms behind the first's.
+        let free = onTime(600);
+        for (const send of sends) {
+            send(600, free, 75, 1);
+            free += 75;
         }
-        ok(stats.window(start + 300).queueDelayMs < 1, 'got ' + stats.window(start + 300).queueDelayMs);
-        // A late packet of an older picture is no delay sample either.
-        stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: ts - 1500, clockRate: VIDEO, bytes: 1000,
-                         now: start + 400, video: true });
-        ok(stats.window(start + 400).queueDelayMs < 1);
-        // The next picture arriving late is.
-        stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: ts + 1500, clockRate: VIDEO, bytes: 1000,
-                         now: start + 1000 / 60 + 200, video: true });
-        ok(Math.abs(stats.window(start + 300).queueDelayMs - 200) < 1);
+        let worst = 0;
+        for (let n = 601; n < 720; n++) {
+            sends.forEach((send, s) => {
+                const at = Math.max(onTime(n) + s * 0.5, free);
+                free = at + 0.25;
+                send(n, at);
+                worst = Math.max(worst, sampleInto(ctl, stats, at, changes).queueDelayMs);
+            });
+        }
+        ok(worst < 1, 'no standing queue, got ' + worst);
+        strictEqual(changes.length, 0);
+        strictEqual(ctl.tier, 16000);
+    });
+
+    it('a second of pictures all 200 ms late is a queue, and steps down', () => {
+        const stats = new ReceiveStats();
+        const send = pictureSender(stats);
+        const ctl = new TierController({});
+        const changes = [];
+        for (let n = 0; n < 600; n++) send(n, onTime(n));
+        let firstLate = null, downAt = null;
+        for (let n = 600; n < 680; n++) {
+            const at = onTime(n) + 200;
+            if (firstLate === null) firstLate = at;
+            send(n, at);
+            sampleInto(ctl, stats, at, changes);
+            if (downAt === null && changes.length > 0) downAt = at;
+        }
+        deepStrictEqual(changes, [12000]);
+        // Not before the on-time pictures have left the last second.
+        ok(downAt - onTime(599) > 1000, 'down ' + (downAt - onTime(599)) + ' ms after the last on-time picture');
+        ok(Math.abs(stats.window(onTime(679) + 200).queueDelayMs - 200) < 1);
     });
 
     it('is not fooled by the 32-bit timestamp wrapping', () => {

@@ -3,9 +3,11 @@
  *
  * Chooses the tier (kbit/s) the browser offers the Mac. Pure: no timers; the
  * caller passes `now` (ms) with each sample, roughly once a second. Inputs
- * come from ReceiveStats.window() (lossPct, queueDelayMs, videoKbit, which
- * counts RTP payload bytes only), the latest agent budget {kbit, limiting}
- * or null, and a recovery flag.
+ * come from ReceiveStats.window() (lossPct; queueDelayMs, a standing queue:
+ * the least per-picture delay of the last second, so one large picture and
+ * the pictures queued behind it do not count; videoKbit, which counts RTP
+ * payload bytes only), the latest agent budget {kbit, limiting} or null,
+ * and a recovery flag.
  *
  * Down: loss, queuing delay, recovery, or a limiting budget below
  * BUDGET_DOWN x tier -> the highest tier <= min(0.75 x tier,

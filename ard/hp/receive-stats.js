@@ -11,16 +11,28 @@
  * numbers, jitter follows the RFC, and queuing delay is the growth of
  * (arrival time - RTP time) over its own 10 s minimum. That last is a
  * signal that a queue is filling, not a measurement of any one hop. It is
- * taken once per picture, from the first packet of each new RTP timestamp:
- * the rest of a large picture follow at the sender's pace, and their spread
- * is serialization, not queuing. The caller passes the arrival time, taken
- * before any local work (decryption) on the packet.
+ * taken once per picture and stripe, from the first packet of each new RTP
+ * timestamp: the rest of a large picture follow at the sender's pace, and
+ * their spread is serialization, not queuing. The caller passes the arrival
+ * time, taken before any local work (decryption) on the packet.
+ *
+ * One picture's delay says little: the Mac serializes a large picture at
+ * its own pace (about as long at every tier), and the pictures behind it,
+ * on every stripe, wait for it and arrive late by a decaying amount. A
+ * queue that matters is a standing one, under every picture, so window()
+ * reports the smallest per-picture delay of the last DELAY_WINDOW_MS,
+ * pooled across the video SSRCs, and 0 with fewer than DELAY_MIN_SAMPLES
+ * pictures in that time (too few to tell a queue from one late picture).
  */
 
 import { extendSeq } from './seq.js';
 
 export const WINDOW_MS = 2000;
 export const BASELINE_MS = 10000;
+// Queuing delay is the least of the per-picture delays over this long...
+export const DELAY_WINDOW_MS = 1000;
+// ...given at least this many pictures in it.
+export const DELAY_MIN_SAMPLES = 5;
 // The rate is bytes over the span seen, so the first packets do not read
 // as a trickle; but a span of nothing would read as a flood.
 const MIN_RATE_SPAN_MS = 250;
@@ -163,20 +175,27 @@ export class ReceiveStats {
     }
 
     /*
-     * Video over the last WINDOW_MS: percent of packets missing, the
-     * largest queuing delay in ms, and the received rate in kbit/s.
+     * Video over the last WINDOW_MS: percent of packets missing and the
+     * received rate in kbit/s; and the standing queuing delay in ms, the
+     * least per-picture delay over the last DELAY_WINDOW_MS across all
+     * video SSRCs (0 with fewer than DELAY_MIN_SAMPLES pictures).
      */
     window(now) {
         this._prune(now);
         const w = this._window;
-        let expected = 0, received = 0, bytes = 0, queueDelayMs = 0;
+        const delayFrom = now - DELAY_WINDOW_MS;
+        let expected = 0, received = 0, bytes = 0, delays = 0, minDelay = Infinity;
         for (let i = w.head; i < w.items.length; i++) {
             const s = w.items[i];
             expected += s.expected;
             received++;
             bytes += s.bytes;
-            if (s.excess !== null && s.excess > queueDelayMs) queueDelayMs = s.excess;
+            if (s.excess !== null && s.at >= delayFrom) {
+                delays++;
+                if (s.excess < minDelay) minDelay = s.excess;
+            }
         }
+        const queueDelayMs = delays >= DELAY_MIN_SAMPLES ? minDelay : 0;
         const span = this._videoSince === null ? 0
             : Math.min(WINDOW_MS, Math.max(MIN_RATE_SPAN_MS, now - this._videoSince));
         return {
