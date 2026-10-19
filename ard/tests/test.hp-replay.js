@@ -45,7 +45,7 @@ describe('Replay of a captured session', { skip: !path && 'HP_REPLAY_FIXTURE not
 
         const hash = createHash('sha256');
         const stripes = [];
-        let pictures = 0, firstDon = null, stalled = false;
+        let pictures = 0, firstDon = null, needKey = false;
         const assembler = new VideoAssembler({
             baseSsrc: fixture.server.videoBaseSsrc,
             stripes: fixture.server.stripes,
@@ -55,7 +55,7 @@ describe('Replay of a captured session', { skip: !path && 'HP_REPLAY_FIXTURE not
                 stripes.push(p.stripe);
                 pictures++;
             },
-            onStall() { stalled = true; },
+            onNeedKey() { needKey = true; },
         });
 
         let authFailures = 0, audioPackets = 0, serverRtcp = 0, clientRtcp = 0, reprotected = 0;
@@ -84,7 +84,7 @@ describe('Replay of a captured session', { skip: !path && 'HP_REPLAY_FIXTURE not
 
         const expected = fixture.expected;
         strictEqual(authFailures, 0, 'authentication failures');
-        strictEqual(stalled, false, 'assembler stalled');
+        strictEqual(needKey, false, 'assembler needed a key picture');
         strictEqual(audioPackets, expected.audioPackets, 'audio packets');
         ok(serverRtcp > 0, 'server RTCP seen');
         ok(clientRtcp > 0, 'client RTCP seen');

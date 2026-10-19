@@ -6,7 +6,7 @@
  */
 
 import { describe, it } from 'node:test';
-import { deepStrictEqual, doesNotThrow, strictEqual } from 'node:assert';
+import { deepStrictEqual, doesNotThrow, ok, strictEqual } from 'node:assert';
 
 import { VideoAssembler } from '../hp/rtp-video.js';
 
@@ -93,18 +93,18 @@ function picture({ stripe = 0, seq = 0, frame = 0 }, payloads) {
 
 function harness(options = {}) {
     const pictures = [];
-    const stalls = [];
+    const needs = [];
     const asm = new VideoAssembler({
         baseSsrc: BASE,
         stripes: 4,
         onPicture: p => pictures.push(p),
-        onStall: s => stalls.push(s),
+        onNeedKey: s => needs.push(s),
         ...options,
     });
     const push = (packets, now = 0) => {
         for (const p of packets) asm.push(p, now);
     };
-    return { asm, pictures, stalls, push };
+    return { asm, pictures, needs, push };
 }
 
 // Single-packet pictures for tests about ordering
@@ -276,7 +276,7 @@ describe('VideoAssembler ordering', () => {
         deepStrictEqual(h.pictures[2].data, annexB(...PARAMS, slices[1]));
         deepStrictEqual(h.pictures[4].data, annexB(slices[3]));
         deepStrictEqual(h.pictures[5].data, annexB(slices[4]));
-        strictEqual(h.stalls.length, 0);
+        strictEqual(h.needs.length, 0);
     });
 
     it('emits as soon as the expected picture completes, packets interleaved', () => {
@@ -380,7 +380,7 @@ describe('VideoAssembler ordering', () => {
         h.push([partial[1]]);
         strictEqual(h.pictures.length, 3);
         strictEqual(h.asm.stats.ignored, 1);
-        strictEqual(h.stalls.length, 0);
+        strictEqual(h.needs.length, 0);
     });
 
     it('unwraps the decoding order number across 65535 → 0', () => {
@@ -435,8 +435,8 @@ describe('VideoAssembler ordering', () => {
 // ===================================================================
 //  Stall
 // ===================================================================
-describe('VideoAssembler stall', () => {
-    it('fires onStall once when a picture is missing for longer than stallMs', () => {
+describe('VideoAssembler waiting for a key picture', () => {
+    it('calls onNeedKey once when a picture is missing for longer than stallMs', () => {
         const h = harness();
         h.push(keyPicture(10), 1000);
         h.push(trailPicture(12), 1010);          // 11 never arrives
@@ -444,29 +444,110 @@ describe('VideoAssembler stall', () => {
         strictEqual(h.pictures.length, 1);
 
         h.asm.tick(1210);                        // waited exactly 200 ms
-        strictEqual(h.stalls.length, 0);
+        strictEqual(h.needs.length, 0);
+        strictEqual(h.asm.waitingForKey, false);
         h.asm.tick(1211);
-        deepStrictEqual(h.stalls, [{ expectedDon: 11, buffered: 2 }]);
+        deepStrictEqual(h.needs, [{ expectedDon: 11, buffered: 2 }]);
+        strictEqual(h.asm.waitingForKey, true);
 
-        // Nothing more is emitted, not even the missing picture
+        // Nothing is emitted while waiting, and it asks only once
         h.push(trailPicture(11), 1220);
         h.push(trailPicture(14), 1230);
         h.asm.tick(5000);
         strictEqual(h.pictures.length, 1);
-        strictEqual(h.stalls.length, 1);
+        strictEqual(h.needs.length, 1);
         strictEqual(h.asm.stats.pictures, 1);
-        strictEqual(h.asm.stats.ignored, 2);
+        strictEqual(h.asm.stats.ignored, 0);
+        strictEqual(h.asm.diag.waitingKey, true);
     });
 
-    it('detects the stall from push as well as tick', () => {
+    it('resumes at the next complete key picture after a wait', () => {
+        const h = harness();
+        for (let d = 0; d <= 4; d++) h.push(d === 0 ? keyPicture(d) : trailPicture(d), 0);
+        for (let d = 6; d <= 8; d++) h.push(trailPicture(d), 10);   // 5 never arrives
+        h.asm.tick(300);
+        strictEqual(h.needs.length, 1);
+        strictEqual(h.asm.waitingForKey, true);
+        strictEqual(h.pictures.length, 5);
+
+        h.push(keyPicture(9), 400);
+        h.push(trailPicture(10), 410);
+        deepStrictEqual(h.pictures.map(p => p.don), [0, 1, 2, 3, 4, 9, 10]);
+        strictEqual(h.asm.waitingForKey, false);
+        strictEqual(h.asm.stats.skipped, 3);
+        strictEqual(h.needs.length, 1);
+    });
+
+    it('resumes at the first key picture of any stripe', () => {
+        const h = harness();
+        h.push(keyPicture(0), 0);
+        h.push(trailPicture(2, { stripe: 0 }), 10);          // 1 lost on stripe 0
+        h.asm.tick(300);
+        strictEqual(h.asm.waitingForKey, true);
+
+        h.push(keyPicture(3, { stripe: 2 }), 400);
+        deepStrictEqual(h.pictures.map(p => [p.don, p.stripe]), [[0, 0], [3, 2]]);
+        strictEqual(h.asm.waitingForKey, false);
+    });
+
+    it('keeps a picture that completes after a key picture still collecting', () => {
+        const h = harness();
+        h.push(keyPicture(0), 0);
+        h.push(trailPicture(2), 10);                         // 1 lost
+        h.asm.tick(300);
+        strictEqual(h.needs.length, 1);
+
+        const key = picture({ stripe: 1 }, fragments(nal(IDR, 60), 3, 2));
+        h.push([key[0]], 400);
+        h.push(trailPicture(4), 410);                        // completes before 3
+        deepStrictEqual(h.pictures.map(p => p.don), [0]);
+        h.push([key[1]], 420);
+        deepStrictEqual(h.pictures.map(p => p.don), [0, 3, 4]);
+        strictEqual(h.asm.waitingForKey, false);
+        strictEqual(h.needs.length, 1);
+    });
+
+    it('bounds what a wait holds at MAX_BUFFERED', () => {
+        const h = harness();
+        h.push(keyPicture(0), 0);
+        h.push(trailPicture(2), 10);                         // 1 lost
+        h.asm.tick(300);
+        strictEqual(h.asm.waitingForKey, true);
+        for (let d = 3; d < 3 + 600; d++) {
+            h.push(trailPicture(d), 400);
+            ok(h.asm.diag.buffered <= 512);
+        }
+        strictEqual(h.asm.stats.pictures, 1);
+        h.push(keyPicture(700), 500);
+        deepStrictEqual(h.pictures.map(p => p.don), [0, 700]);
+        strictEqual(h.asm.waitingForKey, false);
+    });
+
+    it('asks again after a second loss', () => {
+        const h = harness();
+        h.push(keyPicture(0), 0);
+        h.push(trailPicture(2), 0);
+        h.asm.tick(300);
+        strictEqual(h.needs.length, 1);
+        h.push(keyPicture(3), 400);
+        strictEqual(h.asm.waitingForKey, false);
+
+        h.push(trailPicture(5), 500);                        // 4 lost
+        h.asm.tick(800);
+        strictEqual(h.needs.length, 2);
+        deepStrictEqual(h.needs[1], { expectedDon: 4, buffered: 1 });
+        strictEqual(h.asm.waitingForKey, true);
+    });
+
+    it('detects the loss from push as well as tick', () => {
         const h = harness();
         h.push(keyPicture(10), 0);
         h.push(trailPicture(12), 10);
         h.push(trailPicture(13), 250);
-        deepStrictEqual(h.stalls, [{ expectedDon: 11, buffered: 2 }]);
+        deepStrictEqual(h.needs, [{ expectedDon: 11, buffered: 2 }]);
     });
 
-    it('does not stall when the late picture arrives in time', () => {
+    it('does not wait when the late picture arrives in time', () => {
         const h = harness();
         h.push(keyPicture(10), 0);
         h.push(trailPicture(12), 10);
@@ -475,16 +556,16 @@ describe('VideoAssembler stall', () => {
         h.asm.tick(1000);
 
         deepStrictEqual(h.pictures.map(p => p.don), [10, 11, 12]);
-        strictEqual(h.stalls.length, 0);
+        strictEqual(h.needs.length, 0);
     });
 
-    it('does not stall on an incomplete picture with nothing waiting behind it', () => {
+    it('does not wait on an incomplete picture with nothing waiting behind it', () => {
         const h = harness();
         const slow = picture({ stripe: 1 }, fragments(nal(TRAIL, 60), 11, 2));
         h.push(keyPicture(10), 0);
         h.push([slow[0]], 10);
         h.asm.tick(5000);
-        strictEqual(h.stalls.length, 0);
+        strictEqual(h.needs.length, 0);
         h.push([slow[1]], 5001);
         deepStrictEqual(h.pictures.map(p => p.don), [10, 11]);
     });
@@ -494,29 +575,35 @@ describe('VideoAssembler stall', () => {
         h.push(keyPicture(10), 0);
         h.push(trailPicture(12), 0);
         h.asm.tick(50);
-        strictEqual(h.stalls.length, 0);
+        strictEqual(h.needs.length, 0);
         h.asm.tick(51);
-        strictEqual(h.stalls.length, 1);
+        strictEqual(h.needs.length, 1);
     });
 
-    it('stalls when more than 512 pictures are buffered', () => {
+    it('waits when more than 512 pictures are buffered and keeps at most 512', () => {
         const h = harness();
         h.push(keyPicture(100), 0);
         for (let i = 0; i < 512; i++) h.push(trailPicture(102 + i), 0);
-        strictEqual(h.stalls.length, 0);
+        strictEqual(h.needs.length, 0);
         h.push(trailPicture(102 + 512), 0);
-        deepStrictEqual(h.stalls, [{ expectedDon: 101, buffered: 513 }]);
+        deepStrictEqual(h.needs, [{ expectedDon: 101, buffered: 513 }]);
+        strictEqual(h.asm.diag.buffered, 512);
+        strictEqual(h.asm.stats.skipped, 1);
 
+        // The late picture is not a key picture: dropped, not emitted
         h.push(trailPicture(101), 0);
         strictEqual(h.pictures.length, 1);
+        strictEqual(h.asm.waitingForKey, true);
     });
 
-    it('stalls when no key picture arrives within 512 pictures', () => {
+    it('waits, then starts, when no key picture arrives within 512 pictures', () => {
         const h = harness();
         for (let i = 0; i < 513; i++) h.push(trailPicture(i), i);
-        deepStrictEqual(h.stalls, [{ expectedDon: null, buffered: 513 }]);
+        deepStrictEqual(h.needs, [{ expectedDon: null, buffered: 513 }]);
+        strictEqual(h.asm.waitingForKey, true);
         h.push(keyPicture(513), 600);
-        strictEqual(h.pictures.length, 0);
+        deepStrictEqual(h.pictures.map(p => p.don), [513]);
+        strictEqual(h.asm.waitingForKey, false);
     });
 });
 
@@ -625,14 +712,14 @@ describe('VideoAssembler malformed input', () => {
         }
     });
 
-    it('stalls behind a broken picture once emission has started', () => {
+    it('waits behind a broken picture once emission has started', () => {
         const h = harness();
         const frags = fragments(nal(TRAIL, 90), 21, 3);
         h.push(keyPicture(20), 0);
         h.push(picture({ stripe: 1 }, [frags[1], frags[2]]), 0);
         h.push(trailPicture(22, { stripe: 2 }), 10);
         h.asm.tick(211);
-        deepStrictEqual(h.stalls, [{ expectedDon: 21, buffered: 2 }]);
+        deepStrictEqual(h.needs, [{ expectedDon: 21, buffered: 2 }]);
         strictEqual(h.pictures.length, 1);
     });
 

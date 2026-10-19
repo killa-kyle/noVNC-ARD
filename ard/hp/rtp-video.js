@@ -13,7 +13,8 @@
  * stays missing no longer ends the stream: when emission would stall, the
  * assembler resyncs forward to the nearest complete key picture — an IRAP is a
  * random-access point, decodable with no predecessor — dropping the gap. Only
- * when no key picture is buffered does onStall fire and emission stop.
+ * when no key picture is buffered does onNeedKey fire; the assembler keeps
+ * collecting and resumes at the next key picture.
  *
  * Payloads are kept by reference until their picture is emitted or dropped.
  */
@@ -136,37 +137,42 @@ export class VideoAssembler {
     // onPicture({ don, stripe, frame, key, data })
     //   don:   DON unwrapped to a growing integer; don & 0xffff is the wire value
     //   data:  the picture's NAL units as Annex B (00 00 00 01 start codes)
-    // onStall({ expectedDon, buffered })
+    // onNeedKey({ expectedDon, buffered })
+    //   Once each time a wait for a key picture begins.
     //   expectedDon: the picture that never completed, null if no key picture came
-    constructor({ baseSsrc, stripes, onPicture, onStall, stallMs = 200 }) {
+    constructor({ baseSsrc, stripes, onPicture, onNeedKey, stallMs = 200 }) {
         this._baseSsrc = baseSsrc;
         this._stripes = stripes;
         this._onPicture = onPicture;
-        this._onStall = onStall;
+        this._onNeedKey = onNeedKey;
         this._stallMs = stallMs;
 
         this._pictures = new Map();     // unwrapped DON → picture collecting or waiting
         this._ref = null;               // first wire DON seen; unwrap reference until the start
         this._first = null;             // DON of the first key picture
         this._next = null;              // next DON to emit; null until the first key picture
-        this._stalled = false;
+        this._waiting = false;          // lost a picture; dropping until a key picture
 
         this.stats = {
             packets: 0,         // every push
-            ignored: 0,         // foreign SSRC, no extension, older than the start, or after a stall
+            ignored: 0,         // foreign SSRC, no extension, or older than the start
             malformed: 0,       // unusable payload or header, or a picture that does not fit together
             duplicates: 0,      // packet already held or its picture already emitted
             pictures: 0,        // emitted
             discarded: 0,       // dropped for preceding the first key picture
-            skipped: 0,         // dropped by a resync forward past a missing picture
+            skipped: 0,         // dropped by a resync forward past a missing picture, 
         };
+    }
+
+    get waitingForKey() {
+        return this._waiting;
     }
 
     // A snapshot of where the assembler is, for diagnosing a freeze.
     get diag() {
         return {
             buffered: this._pictures.size, next: this._next,
-            stalled: this._stalled, ignored: this.stats.ignored, malformed: this.stats.malformed,
+            waitingKey: this._waiting, ignored: this.stats.ignored, malformed: this.stats.malformed,
             duplicates: this.stats.duplicates, emitted: this.stats.pictures,
             skipped: this.stats.skipped,
         };
@@ -176,10 +182,6 @@ export class VideoAssembler {
     // carries the picture's packet count.
     push({ ssrc, seq, extension, payload }, nowMs) {
         this.stats.packets++;
-        if (this._stalled) {
-            this.stats.ignored++;
-            return;
-        }
         this._collect(ssrc, seq, extension, payload, nowMs);
         this._checkStall(nowMs);
     }
@@ -243,7 +245,15 @@ export class VideoAssembler {
         pic.key = built.key;
         pic.doneAt = nowMs;
 
-        if (this._next === null && pic.key) this._start(pic);
+        if (this._next === null) {
+            if (pic.key) this._start(pic);
+        } else if (this._waiting) {
+            // Only a key picture ends the wait. Keep everything else: a later
+            // picture may complete before the key picture it follows, and
+            // _checkStall bounds what is held
+            if (pic.key) this._resyncToKey();
+            return;
+        }
         this._emit();
     }
 
@@ -272,6 +282,7 @@ export class VideoAssembler {
         }
         this._pictures = kept;
         this._first = this._next = start + shift;
+        this._waiting = false;
     }
 
     _emit() {
@@ -289,40 +300,48 @@ export class VideoAssembler {
     }
 
     _checkStall(nowMs) {
-        if (this._stalled) return;
-
-        let stall = this._pictures.size > MAX_BUFFERED;
-        if (!stall && this._next !== null) {
-            // The expected picture is not complete, so every complete picture
-            // held here is a later one waiting for it
-            for (const pic of this._pictures.values()) {
-                if (pic.data !== null && nowMs - pic.doneAt > this._stallMs) {
-                    stall = true;
-                    break;
+        if (!this._waiting) {
+            let stall = this._pictures.size > MAX_BUFFERED;
+            if (!stall && this._next !== null) {
+                // The expected picture is not complete, so every complete picture
+                // held here is a later one waiting for it
+                for (const pic of this._pictures.values()) {
+                    if (pic.data !== null && nowMs - pic.doneAt > this._stallMs) {
+                        stall = true;
+                        break;
+                    }
                 }
             }
+            if (!stall) return;
+
+            // Resync forward to the nearest complete key picture if one is
+            // held; otherwise ask for one and keep collecting until it comes
+            if (this._next !== null && this._resyncToKey()) return;
+
+            this._waiting = true;
+            this._onNeedKey({ expectedDon: this._next, buffered: this._pictures.size });
         }
-        if (!stall) return;
 
-        // A missing picture no longer ends the stream: resync forward to the
-        // nearest complete key picture and resume. Only when there is no key
-        // picture to land on does emission give up.
-        if (this._next !== null && this._resyncToKey()) return;
-
-        this._stalled = true;
-        const buffered = this._pictures.size;
-        this._pictures.clear();
-        this._onStall({ expectedDon: this._next, buffered });
+        // Waiting: hold no more than MAX_BUFFERED, oldest pictures go first
+        if (this._pictures.size > MAX_BUFFERED) {
+            const dons = [...this._pictures.keys()].sort((a, b) => a - b);
+            for (const don of dons.slice(0, dons.length - MAX_BUFFERED)) {
+                this._pictures.delete(don);
+                if (this._next === null) this.stats.discarded++;
+                else this.stats.skipped++;
+            }
+        }
     }
 
     // Restart emission at the earliest complete key picture after _next,
     // discarding the stuck gap before it. An IRAP decodes with no predecessor,
     // so the stream continues past an unrecoverable loss instead of stalling.
     // Returns true when it resynced, false when no key picture is buffered.
+    // Resyncing ends any wait for a key picture.
     _resyncToKey() {
         let keyDon = null;
         for (const pic of this._pictures.values()) {
-            if (pic.data !== null && pic.key && pic.don > this._next &&
+            if (pic.data !== null && pic.key && pic.don >= this._next &&
                 (keyDon === null || pic.don < keyDon)) {
                 keyDon = pic.don;
             }
@@ -336,6 +355,7 @@ export class VideoAssembler {
             }
         }
         this._next = keyDon;
+        this._waiting = false;
         this._emit();
         return true;
     }
