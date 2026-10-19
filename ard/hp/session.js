@@ -21,7 +21,7 @@ import { VideoAssembler } from './rtp-video.js';
 import { receiverReport, pictureAck, rateControl } from './feedback.js';
 import { RateController, EVAL_MS } from './rate-control.js';
 import { extendSeq } from './seq.js';
-import { PAYLOAD_TYPE_HEVC } from './offer-template.js';
+import { PAYLOAD_TYPE_HEVC, DEFAULT_TIER } from './offer-template.js';
 
 // WebSocket subprotocol a relay's media endpoint answers to.
 export const MEDIA_SUBPROTOCOL = 'ard-media';
@@ -121,9 +121,10 @@ export class HpSession {
      * onState(state, reason): called on every state change
      * feedback:        { reports, acks, rateControl } — which RTCP to send
      * endpoint:        how the viewer describes itself in the offer
+     * tier:            video bit-rate tier in kbit/s the offer asks for (default 20000)
      */
     constructor({ mediaUrl, mediaChannel, sendOffer, holdOffer, createSink, createAudio, audioMuted, onState,
-                  onResize, feedback, endpoint, WebSocketImpl, now, log, warn }) {
+                  onResize, feedback, endpoint, tier, WebSocketImpl, now, log, warn }) {
         this._mediaUrl = mediaUrl;
         this._mediaChannel = mediaChannel || null;
         this._sendOffer = sendOffer;
@@ -136,6 +137,7 @@ export class HpSession {
         this._onResize = onResize || (() => {});
         this._feedback = Object.assign({ reports: true, acks: true, rateControl: true }, feedback);
         this._endpoint = endpoint;
+        this.tier = Number.isFinite(tier) ? tier : DEFAULT_TIER;
         this._WebSocket = WebSocketImpl || globalThis.WebSocket;
         this._now = now || (() => performance.now());
         this._log = log || (() => {});
@@ -346,7 +348,7 @@ export class HpSession {
         if (this.state !== 'idle' || !this._message1 || !this._wsOpen || this._offerHeld) return;
         this._setState('offering');
         this._secrets = generateSecrets();
-        buildOffer(this._secrets, { endpoint: this._endpoint }).then((offer) => {
+        buildOffer(this._secrets, { endpoint: this._endpoint, tier: this.tier }).then((offer) => {
             if (this.state !== 'offering') return;
             this._sendOffer(offer);
             this._timeout(ANSWER_MS, () => {
@@ -395,6 +397,15 @@ export class HpSession {
     // Ask the server for a new picture size on the open connection: send a
     // fresh offer. The RFB layer has already sent the new VirtualDisplay
     // (0x1d). The picture on screen stays until the new one is ready.
+    // Ask for another bit-rate tier: a re-offer carrying it. False when it
+    // cannot go now (not streaming, or a re-offer is already under way).
+    setTier(tier) {
+        if (this.state !== 'streaming' || this._reoffering) return false;
+        this.tier = tier;
+        this.reoffer();
+        return true;
+    }
+
     reoffer() {
         if (this.state !== 'streaming' || this._reoffering) return;
         this._reoffering = true;
@@ -404,7 +415,7 @@ export class HpSession {
         this._lastPictureAt = this._now();
         if (!this._resizeSignalled) { this._resizeSignalled = true; this._onResize(true); }
         this._pendingSecrets = generateSecrets();
-        buildOffer(this._pendingSecrets, { endpoint: this._endpoint }).then((offer) => {
+        buildOffer(this._pendingSecrets, { endpoint: this._endpoint, tier: this.tier }).then((offer) => {
             if (this._reofferGen !== gen || !this._reoffering) return;
             this._sendOffer(offer);
             this._timeout(ANSWER_MS, () => {

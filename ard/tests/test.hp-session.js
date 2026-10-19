@@ -12,7 +12,7 @@ import { deepStrictEqual, strictEqual, ok } from 'node:assert';
 
 import * as protobuf from '../hp/protobuf.js';
 import * as plist from '../hp/plist.js';
-import { deflate } from '../hp/zlib.js';
+import { deflate, inflate } from '../hp/zlib.js';
 import { createContext } from '../hp/srtp.js';
 import { splitKeyBlock } from '../hp/negotiation.js';
 import { pictureAck } from '../hp/feedback.js';
@@ -138,6 +138,18 @@ function keysFromOffer(offer) {
         audio: splitKeyBlock(offer.slice(36, 128)),
         video: splitKeyBlock(offer.slice(128 + audioSize, 220 + audioSize)),
     };
+}
+
+// The bit-rate rows (field 9 entries whose field 1 is 0) of the video blob in a 0x1c message.
+async function videoRatesFromOffer(offer) {
+    const view = new DataView(offer.buffer, offer.byteOffset);
+    const audioSize = view.getUint16(10);
+    const videoSize = view.getUint16(12);
+    const start = 220 + audioSize;
+    const dict = plist.decode(offer.slice(start, start + videoSize));
+    const blob = protobuf.decode(await inflate(dict.avcMediaStreamNegotiatorMediaBlob));
+    return protobuf.getAll(blob, 9).map(r => protobuf.decode(r))
+        .filter(r => protobuf.get(r, 1) === 0).map(r => protobuf.get(r, 2));
 }
 
 // A one-packet key picture for a stripe: parameter sets and an IDR slice
@@ -817,8 +829,8 @@ describe('High Performance session', () => {
     // ----- resize without reconnecting -----
 
     // Bring a session to 'streaming'.
-    async function stream() {
-        const keys = await negotiate();
+    async function stream(extra) {
+        const keys = await negotiate(extra);
         sinks[0].opts.onFirstFrame();
         strictEqual(session.state, 'streaming');
         return keys;
@@ -852,6 +864,40 @@ describe('High Performance session', () => {
         sinks[1].opts.onFirstPicture();
         ok(sinks[0].closed, 'old sink closed on the new picture');
         strictEqual(session.state, 'streaming');
+    });
+
+    it('offers the tier it is given, and the default without one', async () => {
+        await negotiate({ tier: 8000 });
+        strictEqual(session.tier, 8000);
+        deepStrictEqual(await videoRatesFromOffer(offers[0]),
+            [2400000, 8000000, 16000000, 24000000, 30000000, 40000000]);
+        session.close();
+        await negotiate();
+        strictEqual(session.tier, 20000);
+        ok((await videoRatesFromOffer(offers[0])).includes(20000000));
+    });
+
+    it('re-offers at a new tier while streaming', async () => {
+        await stream({ tier: 8000 });
+        strictEqual(session.setTier(12000), true);
+        strictEqual(session.tier, 12000);
+        await until(() => offers.length === 2, 'the second offer');
+        const rates = await videoRatesFromOffer(offers[1]);
+        ok(rates.includes(12000000));
+        ok(!rates.includes(8000000));
+        // A resize re-offer keeps the tier.
+        session.close();
+        await stream({ tier: 6000 });
+        session.reoffer();
+        await until(() => offers.length === 2, 'the resize offer');
+        ok((await videoRatesFromOffer(offers[1])).includes(6000000));
+    });
+
+    it('does not change tier when not streaming', async () => {
+        create({ tier: 8000 });
+        strictEqual(session.setTier(12000), false);
+        strictEqual(offers.length, 0);
+        strictEqual(session.tier, 8000);
     });
 
     it('routes media to the new stream after a resize', async () => {

@@ -136,7 +136,7 @@ async function buildStreamOffer(mode, blobFields, callId, endpoint) {
  * The complete 0x1c message: header, session id, then for audio and for
  * video a key block followed by that stream's offer.
  */
-export async function buildOffer(secrets, { ntpTime, endpoint = DEFAULT_ENDPOINT } = {}) {
+export async function buildOffer(secrets, { ntpTime, endpoint = DEFAULT_ENDPOINT, tier } = {}) {
     if (ntpTime === undefined) ntpTime = ntpFromUnixMs(Date.now());
     if (secrets.audioKeys.length !== KEY_BLOCK_LENGTH ||
         secrets.videoKeys.length !== KEY_BLOCK_LENGTH ||
@@ -145,10 +145,10 @@ export async function buildOffer(secrets, { ntpTime, endpoint = DEFAULT_ENDPOINT
     }
 
     const audio = await buildStreamOffer(
-        MODE_AUDIO, audioBlobFields({ ssrc: secrets.audioSsrc, ntpTime }),
+        MODE_AUDIO, audioBlobFields({ ssrc: secrets.audioSsrc, ntpTime, tier }),
         secrets.callIds[0], endpoint);
     const video = await buildStreamOffer(
-        MODE_VIDEO, videoBlobFields({ ssrc: secrets.videoSsrc, ntpTime }),
+        MODE_VIDEO, videoBlobFields({ ssrc: secrets.videoSsrc, ntpTime, tier }),
         secrets.callIds[1], endpoint);
 
     const total = 36 + KEY_BLOCK_LENGTH + audio.length + KEY_BLOCK_LENGTH + video.length;

@@ -1642,6 +1642,13 @@ RFB.prototype._ardHpResize = function (display) {
     return true;
 };
 
+// Ask the running High Performance session for another video bit-rate tier
+// (kbit/s). It takes a re-offer; false when none can start now.
+RFB.prototype.ardHpSetTier = function (tier) {
+    this._ardHpTier = tier;
+    return !!this._ardHp && this._ardHp.setTier(tier);
+};
+
 // Soften the held picture while the new size is on its way, the way Apple's
 // viewer does, and clear it when the new picture arrives.
 RFB.prototype._ardHpResizeVisual = function (active) {
@@ -1683,6 +1690,7 @@ RFB.prototype._ardHpStart = function () {
         holdOffer,
         feedback: this._ardHpFeedback,
         endpoint: this._ardHpEndpoint,
+        tier: this._ardHpTier,
         sendOffer: bytes => RFB.messages.ardMediaStreamNegotiation(this._sock, bytes),
         createSink: opts => new VideoSink(Object.assign({
             target: this._canvas,

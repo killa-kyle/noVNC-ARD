@@ -15,6 +15,7 @@ import {
     parseMessage1, generateSecrets, splitKeyBlock, buildOffer, parseAnswer, parseStreamPorts, parseStreamError,
     ntpFromUnixMs, KEY_BLOCK_LENGTH,
 } from '../hp/negotiation.js';
+import { tableFields, TIERS, DEFAULT_TIER } from '../hp/offer-template.js';
 
 function u16(n) { return [(n >> 8) & 0xff, n & 0xff]; }
 function ascii(s) { return Array.from(s, c => c.charCodeAt(0)); }
@@ -211,6 +212,17 @@ describe('Offer (message 0x1c)', () => {
         strictEqual(protobuf.get(entries[1], 4), 14);
     });
 
+    it('is unchanged at the default tier', async () => {
+        const s = fixedSecrets();
+        strictEqual(DEFAULT_TIER, 20000);
+        deepStrictEqual(TIERS, [4000, 6000, 8000, 10000, 12000, 16000, 20000]);
+        const plain = await buildOffer(s, { ntpTime });
+        const tiered = await buildOffer(s, { ntpTime, tier: 20000 });
+        deepStrictEqual(tiered, plain);
+        const other = await buildOffer(s, { ntpTime, tier: 8000 });
+        ok(other.length !== plain.length || !other.every((b, i) => b === plain[i]));
+    });
+
     it('refuses malformed secrets', async () => {
         const s = fixedSecrets();
         s.audioKeys = new Uint8Array(10);
@@ -304,5 +316,30 @@ describe('Stream error', () => {
     it('rejects a truncated error', () => {
         strictEqual(parseStreamError(IN_USE.subarray(0, 14)), null);
         strictEqual(parseStreamError(new Uint8Array([0])), null);
+    });
+});
+
+describe('Offer table tiers', () => {
+    const rows = t => tableFields(t).map(([, r]) => r.map(([, v]) => v));
+    const base = [
+        [4074, 0, 16384], [1, 299], [4, 6500], [16, 4100],
+        [0, 6000000, 131072], [0, 20000000, 98304], [0, 40000000, 12288],
+        [0, 60000000, 262144], [0, 75000000, 524288], [0, 100000000, 1048576],
+    ];
+
+    it('is the observed table at 20000 kbit', () => {
+        deepStrictEqual(rows(20000), base);
+        deepStrictEqual(rows(), base);
+        deepStrictEqual(tableFields(20000).map(f => f[0]), Array(10).fill(9));
+    });
+
+    it('scales the bit-rate rows to the tier and nothing else', () => {
+        const r = rows(8000);
+        strictEqual(r.length, 10);
+        deepStrictEqual(r.slice(0, 4), base.slice(0, 4));
+        deepStrictEqual(r.slice(4).map(x => x[1]),
+            [2400000, 8000000, 16000000, 24000000, 30000000, 40000000]);
+        deepStrictEqual(r.slice(4).map(x => x[2]), base.slice(4).map(x => x[2]));
+        deepStrictEqual(r.slice(4).map(x => x[0]), Array(6).fill(0));
     });
 });

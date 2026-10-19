@@ -41,8 +41,17 @@ const TABLE = [
     [0, 100000000, 1048576],
 ];
 
-function tableFields() {
-    return TABLE.map(row => [9, row.map((value, i) => [i + 1, value])]);
+// Field 9 also sets the Mac's encoder bit rate: the rows with field 1 = 0 are
+// bit-rate steps in bit/s (field 2). They are tabulated for DEFAULT_TIER and
+// scale with the requested tier (kbit/s).
+export const TIERS = [4000, 6000, 8000, 10000, 12000, 16000, 20000];
+export const DEFAULT_TIER = 20000;
+
+export function tableFields(tier = DEFAULT_TIER) {
+    return TABLE.map((row) => {
+        const scaled = row[0] === 0 ? [0, Math.round(row[1] * tier / DEFAULT_TIER), row[2]] : row;
+        return [9, scaled.map((value, i) => [i + 1, value])];
+    });
 }
 
 function payloadEntry(payloadType, variants, features, last) {
@@ -65,14 +74,14 @@ export function endpointFields(endpoint = DEFAULT_ENDPOINT) {
 }
 
 // ntpTime: BigInt, NTP seconds in the upper 32 bits.
-export function audioBlobFields({ ssrc, ntpTime }) {
+export function audioBlobFields({ ssrc, ntpTime, tier }) {
     return [
         [1, 1],
         [2, 1],
         [3, [[1, ssrc], [2, 0], [3, 0], [4, 7807], [5, 0], [6, 0]]],
         [6, MEDIA_SOFTWARE],
         [8, 0],
-        ...tableFields(),
+        ...tableFields(tier),
         [13, ntpTime],
         [14, 2],
         [16, 0],
@@ -80,7 +89,7 @@ export function audioBlobFields({ ssrc, ntpTime }) {
     ];
 }
 
-export function videoBlobFields({ ssrc, ntpTime }) {
+export function videoBlobFields({ ssrc, ntpTime, tier }) {
     return [
         [1, 1],
         [2, 1],
@@ -97,7 +106,7 @@ export function videoBlobFields({ ssrc, ntpTime }) {
         ]],
         [6, MEDIA_SOFTWARE],
         [8, 0],
-        ...tableFields(),
+        ...tableFields(tier),
         [13, ntpTime],
         [14, 2],
         [16, 0],
