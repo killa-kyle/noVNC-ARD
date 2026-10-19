@@ -666,6 +666,38 @@ describe('High Performance session', () => {
         strictEqual(block.getUint32(16), 106);
     });
 
+    it('the video report counts loss on stripes 1-3', async () => {
+        const keys = await negotiate();
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        const videoReader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
+
+        // Stripe 3 sees sequence numbers 200, 201, then 205: three never arrive.
+        for (const [seq, frame] of [[200, 1], [201, 2], [205, 3]]) {
+            ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 3, seq, don: 5 + frame, frame })));
+            mock.timers.tick(7);
+        }
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 100, don: 5, frame: 1 })));
+        await until(() => session.stats.videoPackets === 4, 'four video packets');
+        sinks[0].opts.onFirstFrame();
+        ws.sent.length = 0;
+
+        for (let i = 0; i < 20; i++) {
+            mock.timers.tick(50);
+            await settle(4);
+        }
+        await until(() => ws.sent.length >= 21, 'rate reports and the video receiver report');
+        let block = null;
+        for (const msg of ws.sent) {
+            if (msg[0] !== CHANNEL_VIDEO) continue;
+            const plain = await videoReader.unprotectRtcp(msg.subarray(1));
+            if (plain[1] === 201) block = new DataView(plain.buffer, plain.byteOffset);
+        }
+        ok(block, 'a video receiver report was sent');
+        strictEqual(block.getUint32(8), SERVER_VIDEO_SSRC, 'still names the first stripe');
+        strictEqual(block.getUint32(12) & 0xffffff, 3, 'cumulative lost');
+        strictEqual(block.getUint32(16), 100, 'first stripe highest seq');
+    });
+
     it('sends only the feedback it is told to', async () => {
         const keys = await negotiate({ feedback: { reports: false, acks: false, rateControl: false } });
         const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);

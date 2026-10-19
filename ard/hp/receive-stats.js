@@ -117,19 +117,17 @@ class Stream {
         return { advance, excess: rel - q.peek().rel };
     }
 
-    fields() {
+    // Loss since the previous call, and since the start; advances the interval.
+    takeLoss() {
         const expected = this.maxSeq - this.baseSeq + 1;
         const expectedInterval = expected - this.expectedPrior;
         const receivedInterval = this.received - this.receivedPrior;
         this.expectedPrior = expected;
         this.receivedPrior = this.received;
-        const lostInterval = expectedInterval - receivedInterval;
         return {
-            highestSeq: this.maxSeq,
-            fractionLost: expectedInterval <= 0 || lostInterval <= 0
-                ? 0 : Math.floor(lostInterval * 256 / expectedInterval),
+            expectedInterval,
+            receivedInterval,
             cumulativeLost: Math.max(0, expected - this.received),
-            jitter: Math.floor(this.jitter),
         };
     }
 }
@@ -166,12 +164,33 @@ export class ReceiveStats {
     }
 
     /*
-     * Report block fields for one stream, covering the time since the
-     * previous call for that stream. null if nothing has arrived on it.
+     * Report block fields for the stream `ssrc`, covering the time since
+     * the previous call: its highest sequence number and jitter, and the
+     * loss over every stream in `lossSsrcs` (a picture on several stripes
+     * is lost when any stripe's packet is), summed. Each of those streams
+     * advances its interval once per call. null if nothing has arrived on
+     * `ssrc`.
      */
-    rrFields(ssrc) {
+    rrFields(ssrc, lossSsrcs = [ssrc]) {
         const stream = this._streams.get(ssrc);
-        return stream ? stream.fields() : null;
+        if (!stream) return null;
+        let expectedInterval = 0, receivedInterval = 0, cumulativeLost = 0;
+        for (const id of new Set(lossSsrcs)) {
+            const s = this._streams.get(id);
+            if (!s) continue;
+            const loss = s.takeLoss();
+            expectedInterval += loss.expectedInterval;
+            receivedInterval += loss.receivedInterval;
+            cumulativeLost += loss.cumulativeLost;
+        }
+        const lostInterval = expectedInterval - receivedInterval;
+        return {
+            highestSeq: stream.maxSeq,
+            fractionLost: expectedInterval <= 0 || lostInterval <= 0
+                ? 0 : Math.floor(lostInterval * 256 / expectedInterval),
+            cumulativeLost,
+            jitter: Math.floor(stream.jitter),
+        };
     }
 
     /*

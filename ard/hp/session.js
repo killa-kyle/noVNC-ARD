@@ -1089,8 +1089,11 @@ export class HpSession {
     _sendReports() {
         if (!this._feedback.reports) return;
         const now = this._now();
-        const report = (channel, ssrc, sourceSsrc) => {
-            const fields = this._recvStats.rrFields(sourceSsrc);
+        // The report names `sourceSsrc` (as Apple's viewer does) but counts
+        // loss over `lossSsrcs`: the video's other stripes would otherwise
+        // never be reported.
+        const report = (channel, ssrc, sourceSsrc, lossSsrcs = [sourceSsrc]) => {
+            const fields = this._recvStats.rrFields(sourceSsrc, lossSsrcs);
             if (!fields) return;
             const sr = this._lastSenderReport[channel];
             this._sendRtcp(channel, receiverReport({
@@ -1102,6 +1105,8 @@ export class HpSession {
             }));
         };
         report(CHANNEL_AUDIO, this._secrets.audioSsrc, this._answer.audio.ssrc);
-        report(CHANNEL_VIDEO, this._secrets.videoSsrc, this._answer.video.ssrc);
+        const { ssrc: base, stripes } = this._answer.video;
+        report(CHANNEL_VIDEO, this._secrets.videoSsrc, base,
+            Array.from({ length: Math.max(1, stripes) }, (_, i) => base + i));
     }
 }

@@ -109,6 +109,39 @@ describe('ReceiveStats receiver report fields', () => {
         ok(jitter > 100, 'a 2 ms swing is 180 units, got ' + jitter);
     });
 
+    it('reports loss on every stripe under the first stripe\'s SSRC', () => {
+        const stats = new ReceiveStats();
+        const all = [0, 1, 2, 3].map(i => SSRC + i);
+        for (const ssrc of all) feed(stats, { count: 100, ssrc, missing: ssrc === SSRC + 2 ? [10, 11, 12, 13, 14, 15, 16, 17, 18, 19] : [] });
+        const a = stats.rrFields(SSRC, all);
+        strictEqual(a.cumulativeLost, 10);
+        strictEqual(a.fractionLost, Math.floor(10 * 256 / 400));
+        // Each stripe's interval advanced once: a clean second interval reads 0.
+        for (const ssrc of all) feed(stats, { first: 100, count: 100, ssrc });
+        const b = stats.rrFields(SSRC, all);
+        strictEqual(b.fractionLost, 0);
+        strictEqual(b.cumulativeLost, 10);
+    });
+
+    it('keeps the first stripe\'s highestSeq and jitter', () => {
+        const stats = new ReceiveStats();
+        feed(stats, { count: 50, ssrc: SSRC });
+        feed(stats, { count: 80, ssrc: SSRC + 1, extraMs: i => (i % 2 ? 3 : 0) });
+        const one = new ReceiveStats();
+        feed(one, { count: 50, ssrc: SSRC });
+        const r = stats.rrFields(SSRC, [SSRC, SSRC + 1]);
+        strictEqual(r.highestSeq, 49);
+        strictEqual(r.jitter, one.rrFields(SSRC).jitter);
+    });
+
+    it('skips stripes it has not seen and nulls without the first', () => {
+        const stats = new ReceiveStats();
+        feed(stats, { count: 10, ssrc: SSRC + 1, missing: [3] });
+        strictEqual(stats.rrFields(SSRC, [SSRC, SSRC + 1]), null);
+        feed(stats, { count: 10, ssrc: SSRC });
+        strictEqual(stats.rrFields(SSRC, [SSRC, SSRC + 1, SSRC + 2]).cumulativeLost, 1);
+    });
+
     it('keeps each SSRC apart', () => {
         const stats = new ReceiveStats();
         feed(stats, { count: 50, ssrc: 1, missing: [3] });
