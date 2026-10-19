@@ -42,16 +42,20 @@ const TABLE = [
 ];
 
 // Field 9 also sets the Mac's encoder bit rate: the rows with field 1 = 0 are
-// bit-rate steps in bit/s (field 2). They are tabulated for DEFAULT_TIER and
-// scale with the requested tier (kbit/s). The Mac's encoder target never goes
-// below about 12 Mbit/s, so lower tiers would change nothing.
-export const TIERS = [12000, 16000, 20000];
+// bit-rate steps in bit/s (field 2). The Mac caps its encoder at one of them
+// (the 60 Mbit/s row on a Mac seen on 2026-10-19: `bitrateCap` in its rate
+// controller log) and starts its target at about 20.8 Mbit/s whatever the
+// path does, so the encoder runs at the lower of the two. At DEFAULT_TIER the
+// table is Apple's; below it every bit-rate row is clamped to the tier, so the
+// cap is the tier whichever row the Mac takes.
+export const TIERS = [6000, 8000, 12000, 16000, 20000];
 export const DEFAULT_TIER = 20000;
 
 export function tableFields(tier = DEFAULT_TIER) {
+    const cap = tier * 1000;
     return TABLE.map((row) => {
-        const scaled = row[0] === 0 ? [0, Math.round(row[1] * tier / DEFAULT_TIER), row[2]] : row;
-        return [9, scaled.map((value, i) => [i + 1, value])];
+        const clamped = row[0] === 0 && tier < DEFAULT_TIER ? [0, Math.min(row[1], cap), row[2]] : row;
+        return [9, clamped.map((value, i) => [i + 1, value])];
     });
 }
 

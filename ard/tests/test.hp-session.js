@@ -1403,7 +1403,7 @@ describe('High Performance session', () => {
         await negotiate({ tier: 12000 });
         strictEqual(session.tier, 12000);
         deepStrictEqual(await videoRatesFromOffer(offers[0]),
-            [3600000, 12000000, 24000000, 36000000, 45000000, 60000000]);
+            [6000000, 12000000, 12000000, 12000000, 12000000, 12000000]);
         session.close();
         await negotiate();
         strictEqual(session.tier, 16000);
@@ -1720,25 +1720,22 @@ describe('High Performance session', () => {
         pass(5100);                          // no answer, and nothing more arrives
         await until(() => offers.length === 3, 'the recovery re-offer');
         strictEqual(session.state, 'streaming');
-        strictEqual(await tierOfOffer(offers[2]), 12000);
+        strictEqual(await tierOfOffer(offers[2]), 8000);
     });
 
     it('stays at the lowest tier while the loss goes on', async () => {
-        await lossDown();
-        await answerReoffer();
-        // The new stream is lossy too, sampled every second, past the grace:
-        // at the lowest tier there is no further step.
-        const feed2 = await videoFeed(keysFromOffer(offers[1]).video);
-        for (let i = 0; i < 3; i++) {
-            await feed2(3, 4);
+        const keys = await stream({ tier: 6000 });
+        const feed = await videoFeed(keys.video);
+        await pastGrace(feed);
+        // Lossy, sampled every second, past the grace: at the lowest tier
+        // there is no further step.
+        for (let i = 0; i < 4; i++) {
+            await feed(3, 4);
             pass(1000);
             await settle();
         }
-        await feed2(3, 4);
-        pass(1000);
-        await settle();
-        strictEqual(offers.length, 2, 'no down below the lowest tier');
-        strictEqual(session.tier, 12000);
+        strictEqual(offers.length, 1, 'no down below the lowest tier');
+        strictEqual(session.tier, 6000);
     });
 
     it('sees no loss or delay in the start grace, on connect and after a swap', async () => {
@@ -1886,7 +1883,7 @@ describe('High Performance session', () => {
         };
         strictEqual(await startTier({ tierKey: 'mac1' }), 20000);
         strictEqual(await startTier({ tierKey: 'mac1', maxKbit: 16000 }), 16000);
-        strictEqual(await startTier({ tierKey: 'mac1', maxKbit: 6000 }), 12000, 'a cap below the ladder');
+        strictEqual(await startTier({ tierKey: 'mac1', maxKbit: 4000 }), 6000, 'a cap below the ladder');
         strictEqual(await startTier({ tierKey: 'mac2' }), 16000, 'nothing stored');
         strictEqual(await startTier({ tierKey: 'mac3' }), 16000, 'not a tier');
         strictEqual(await startTier({ tierKey: 'old' }), 16000, 'older than a day');
@@ -1945,7 +1942,7 @@ describe('High Performance session', () => {
         mock.timers.tick(5000);
         await settle();
         strictEqual(session.state, 'failed');
-        deepStrictEqual(seen, [12000]);
+        deepStrictEqual(seen, [12000, 8000]);
         strictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')).tier, 16000);
     });
 
@@ -2014,8 +2011,8 @@ describe('High Performance session', () => {
         ws.deliver(2, controlFrame({ budgetKbit: 9000 }));
         pass(1000);
         await until(() => offers.length === 2, 'the tier re-offer');
-        strictEqual(session.tier, 12000);
-        strictEqual(await tierOfOffer(offers[1]), 12000);
+        strictEqual(session.tier, 6000);
+        strictEqual(await tierOfOffer(offers[1]), 6000);
     });
 
     it('takes an agent budget up to 3 s old and no older', async () => {
@@ -2031,7 +2028,7 @@ describe('High Performance session', () => {
             session.close();
             return tier;
         };
-        strictEqual(await sampledAt(2900), 12000);
+        strictEqual(await sampledAt(2900), 6000);
         strictEqual(await sampledAt(3100), 16000);
     });
 
