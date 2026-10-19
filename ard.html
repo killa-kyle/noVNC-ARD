@@ -343,6 +343,14 @@
             // No checkbox yet (early call): default ON unless explicitly stored '0'.
             try { return localStorage.getItem('ardHpShowLocalCursor') !== '0'; } catch (e) { return true; }
         }
+        // Operator cap on the High Performance tier, in kbit/s:
+        // localStorage['ardHpMaxKbit']. Unset or not a number: no cap.
+        function ardHpMaxKbit() {
+            try {
+                const raw = localStorage.getItem('ardHpMaxKbit');
+                return raw === null ? null : Number(raw);
+            } catch (e) { return null; }
+        }
         let ardHpSupported = false;
         let ardHpDisabled = false;
         // The connection in progress asked for High Performance:
@@ -458,6 +466,11 @@
             rfb._ardHpDisplay = (hp && ardResizeToWindow) ? ardWindowDisplay() : ardHpDisplay();
             rfb._ardHpAudio = ardHpAudio;
             rfb._ardHpShowLocalCursor = ardHpShowLocalCursor();
+            // The tier this browser last held for this Mac is kept by its
+            // name (the RFB layer falls back to the name the Mac gives);
+            // an operator may cap it.
+            rfb._ardHpTierKey = UI.desktopName || null;
+            rfb._ardHpMaxKbit = ardHpMaxKbit();
             rfb.ardAudioMuted = ardAudioMuted;
             // Virtual Display in Standard quality is the ordinary virtual
             // login: nothing more is asked of the Mac.
@@ -468,7 +481,9 @@
             const d = e.detail;
             if (d.state === 'streaming') {
                 const v = d.video;
-                ardNotice('High Performance' + (v ? ' · ' + v.width + '×' + v.height : ''), 'normal', 3000);
+                const tier = d.stats && d.stats.tier;
+                ardNotice('High Performance' + (v ? ' · ' + v.width + '×' + v.height : '') +
+                          (tier ? ' · ' + tier / 1000 + ' Mbit/s' : ''), 'normal', 3000);
                 // The size now on screen is the baseline the follower measures from.
                 if (ardResizeToWindow) {
                     const display = ardWindowDisplay();
@@ -539,7 +554,7 @@
                 last = { at: now, bytes: s.stats.videoBytes, pictures: s.stats.pictures,
                          audioBytes: s.stats.audioBytes };
                 document.getElementById('ard_info_video').textContent =
-                    'HEVC ' + s.video.width + '×' + s.video.height + rate;
+                    'HEVC ' + s.video.width + '×' + s.video.height + ' · tier ' + s.tier / 1000 + ' Mbit/s' + rate;
                 document.getElementById('ard_info_audio').textContent =
                     !ardHpAudio ? 'Off' : !s.audioReady ? 'Not available' :
                     (ardAudioMuted ? 'Muted' : 'On') + akbit;

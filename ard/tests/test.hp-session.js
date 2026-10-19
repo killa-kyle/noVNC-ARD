@@ -152,6 +152,23 @@ async function videoRatesFromOffer(offer) {
         .filter(r => protobuf.get(r, 1) === 0).map(r => protobuf.get(r, 2));
 }
 
+// The tier an offer asks for: its second bit-rate row is the tier in bit/s.
+async function tierOfOffer(offer) {
+    return (await videoRatesFromOffer(offer))[1] / 1000;
+}
+
+// localStorage, in memory.
+function fakeStorage(init = {}) {
+    const m = new Map(Object.entries(init));
+    return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => { m.set(k, String(v)); } };
+}
+
+// The agent's control frame after its channel byte: version, budget, queue,
+// RTT, loss and drops.
+function controlFrame({ budgetKbit = 0, version = 1 } = {}) {
+    return new Uint8Array([version, ...u32(budgetKbit), ...u16(20), ...u16(40), ...u16(0), ...u32(0)]);
+}
+
 // A one-packet key picture for a stripe: parameter sets and an IDR slice
 // aggregated, as the server starts each stream.
 function keyPicturePacket({ stripe, seq, don, frame }) {
@@ -635,55 +652,6 @@ describe('High Performance session', () => {
         strictEqual(block.getUint32(16), 106);
     });
 
-    it('adapts rate-control field D to assembler loss and holds the ceiling when idle', async () => {
-        const keys = await negotiate();
-        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
-        const videoReader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
-
-        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 100, don: 5, frame: 1 })));
-        await until(() => session.stats.pictures === 1, 'the first picture');
-        sinks[0].opts.onFirstFrame();
-        strictEqual(session.state, 'streaming');
-
-        // Read field D of the one RCTL packet a _tick emits. `skipped` stands in
-        // for the assembler's cumulative resync-drop count; `flowing` whether a
-        // video packet is recent, and `evalReset` whether this tick re-evaluates
-        // the estimate (true) or only re-sends the held one (false).
-        async function tickD({ skipped, flowing = true, evalReset = true }) {
-            Object.defineProperty(session._assembler, 'diag', { configurable: true, get: () => ({ skipped }) });
-            session._lastVideoPacketAt = flowing ? session._now() : session._now() - 10000;
-            if (evalReset) session._lastRateEvalAt = null;
-            ws.sent.length = 0;
-            session._tick();
-            await settle(4);
-            let d = null;
-            for (const msg of ws.sent) {
-                const plain = await videoReader.unprotectRtcp(msg.subarray(1));
-                ok(plain, 'our RTCP verifies');
-                if (plain[1] === 204 && String.fromCharCode(...plain.subarray(8, 12)) === 'RCTL') {
-                    d = new DataView(plain.buffer, plain.byteOffset).getUint16(30);
-                }
-            }
-            ok(d !== null, 'an RCTL packet was sent');
-            return d;
-        }
-
-        // No loss: the estimate sits at the ceiling (60000 kbit/s), as before.
-        strictEqual(await tickD({ skipped: 0 }), 60000);
-        // The assembler skips a picture: the estimate backs off.
-        const dropped = await tickD({ skipped: 5 });
-        ok(dropped < 60000, 'D backs off on loss, got ' + dropped);
-        // Loss stops (skipped holds steady): the estimate probes back up.
-        ok(await tickD({ skipped: 5 }) > dropped, 'D recovers when loss stops');
-        // Video goes idle: D returns to the ceiling however bad skipped looks.
-        strictEqual(await tickD({ skipped: 9999, flowing: false }), 60000);
-
-        // Within the eval window (no reset) the report still fires, carrying the
-        // held estimate — a fresh skipped spike does not move it until the next eval.
-        const held = await tickD({ skipped: 0 });                 // eval: back at ceiling
-        strictEqual(await tickD({ skipped: 500, evalReset: false }), held);
-    });
-
     it('sends only the feedback it is told to', async () => {
         const keys = await negotiate({ feedback: { reports: false, acks: false, rateControl: false } });
         const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
@@ -905,8 +873,8 @@ describe('High Performance session', () => {
             [2400000, 8000000, 16000000, 24000000, 30000000, 40000000]);
         session.close();
         await negotiate();
-        strictEqual(session.tier, 20000);
-        ok((await videoRatesFromOffer(offers[0])).includes(20000000));
+        strictEqual(session.tier, 16000);
+        strictEqual(await tierOfOffer(offers[0]), 16000);
     });
 
     it('re-offers at a new tier while streaming', async () => {
@@ -1124,6 +1092,256 @@ describe('High Performance session', () => {
         strictEqual(session.state, 'streaming');
         ok(!sinks[0].closed);
         strictEqual(sinks.length, 1);
+    });
+
+    // ----- the bitrate tier -----
+
+    // Key pictures from the server whose sequence numbers skip `gap` packets
+    // before each: loss as receive stats count it, while every picture
+    // still completes.
+    async function lossyFeed(videoKeys, gap = 4) {
+        const server = await createContext(videoKeys.fromServer.key, videoKeys.fromServer.salt);
+        let seq = 100, don = 1, frame = 1;
+        return async (count) => {
+            const before = session.stats.videoPackets;
+            for (let i = 0; i < count; i++) {
+                ws.deliver(CHANNEL_VIDEO, await server.protectRtp(
+                    keyPicturePacket({ stripe: 0, seq, don, frame })));
+                seq += gap + 1;
+                don++;
+                frame++;
+            }
+            await until(() => session.stats.videoPackets === before + count, count + ' video packets');
+        };
+    }
+
+    const SAME_STREAM = { audioSsrc: SERVER_AUDIO_SSRC, videoSsrc: SERVER_VIDEO_SSRC,
+                          width: 1920, height: 1080, stripes: 4 };
+
+    // Answer the re-offer in flight and show its first picture.
+    async function answerReoffer() {
+        const count = sinks.length;
+        session.handleAnswer(await answerWith(SAME_STREAM));
+        await until(() => sinks.length === count + 1, 'the new sink');
+        sinks[sinks.length - 1].opts.onFirstPicture();
+        strictEqual(session.reoffering(), false);
+    }
+
+    it('steps the tier down on loss with exactly one re-offer at the lower table', async () => {
+        const keys = await stream();
+        strictEqual(session.tier, 16000);
+        const feed = await lossyFeed(keys.video);
+        await feed(3);
+        pass(1000);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        strictEqual(session.tier, 12000);
+        strictEqual(await tierOfOffer(offers[1]), 12000);
+        // The loss goes on while the re-offer is out: no second one.
+        await feed(3);
+        pass(3000);
+        await settle();
+        strictEqual(offers.length, 2);
+        strictEqual(session.state, 'streaming');
+    });
+
+    it('fails once, as media-stopped, when a tier re-offer gets no answer', async () => {
+        const keys = await stream();
+        const feed = await lossyFeed(keys.video);
+        await feed(3);
+        pass(50);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        pass(5000);
+        await settle();
+        strictEqual(session.state, 'failed');
+        strictEqual(session.failure.startsWith('media-stopped'), true);
+        deepStrictEqual(states.filter(s => s.startsWith('failed')), ['failed:media-stopped']);
+        pass(5000);
+        await settle();
+        strictEqual(offers.length, 2);
+    });
+
+    it('keeps to one down in 4 s while the loss goes on', async () => {
+        const keys = await stream();
+        const feed = await lossyFeed(keys.video);
+        await feed(3);
+        pass(50);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        await answerReoffer();
+        // The new stream is lossy too, sampled every second.
+        const feed2 = await lossyFeed(keysFromOffer(offers[1]).video);
+        for (let i = 0; i < 3; i++) {
+            await feed2(3);
+            pass(1000);
+            await settle();
+        }
+        strictEqual(offers.length, 2, 'no down inside 4 s of the last');
+        await feed2(3);
+        pass(1000);
+        await until(() => offers.length === 3, 'the next down');
+        strictEqual(await tierOfOffer(offers[2]), 8000);
+    });
+
+    it('a resize re-offer carries the tier in force', async () => {
+        await stream({ tier: 8000 });
+        session.reoffer();
+        await until(() => offers.length === 2, 'the resize offer');
+        strictEqual(await tierOfOffer(offers[1]), 8000);
+        session.close();
+
+        const keys = await stream();
+        const feed = await lossyFeed(keys.video);
+        await feed(3);
+        pass(50);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        await answerReoffer();
+        session.reoffer();
+        await until(() => offers.length === 3, 'the resize offer');
+        strictEqual(await tierOfOffer(offers[2]), 12000);
+    });
+
+    it('a recovery re-offers a tier lower', async () => {
+        await stream();
+        pass(3100);                          // no new picture: stalled
+        await until(() => offers.length === 2, 'the recovery re-offer');
+        strictEqual(session.tier, 12000);
+        strictEqual(await tierOfOffer(offers[1]), 12000);
+    });
+
+    it('does not count tier re-offers against the recovery limit', async () => {
+        const keys = await stream();
+        const feed = await lossyFeed(keys.video);
+        await feed(3);
+        pass(50);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        await answerReoffer();
+        for (let i = 0; i < 3; i++) {
+            const before = offers.length;
+            session._streamingFail('media-stopped');
+            await until(() => offers.length === before + 1, 'a recovery re-offer');
+            await answerReoffer();
+            strictEqual(session.state, 'streaming');
+        }
+        session._streamingFail('media-stopped');
+        await until(() => session.state === 'failed', 'the fall back');
+    });
+
+    it('carries the current tier in RCTL field D', async () => {
+        const keys = await stream({ tier: 10000 });
+        const reader = await createContext(keys.video.toServer.key, keys.video.toServer.salt);
+        ws.sent.length = 0;
+        pass(50);
+        await until(() => ws.sent.length >= 1, 'an RCTL report');
+        const plain = await reader.unprotectRtcp(ws.sent[0].subarray(1));
+        strictEqual(String.fromCharCode(...plain.subarray(8, 12)), 'RCTL');
+        strictEqual(new DataView(plain.buffer, plain.byteOffset).getUint16(30), 10000);
+    });
+
+    it('starts at the tier stored for this Mac, capped by maxKbit', async () => {
+        const storage = fakeStorage({ 'ardHpTier:mac1': '10000', 'ardHpTier:mac3': '9999' });
+        await negotiate({ tierKey: 'mac1', storage });
+        strictEqual(await tierOfOffer(offers[0]), 10000);
+        session.close();
+        await negotiate({ tierKey: 'mac1', storage, maxKbit: 6000 });
+        strictEqual(await tierOfOffer(offers[0]), 6000);
+        session.close();
+        await negotiate({ tierKey: 'mac2', storage });
+        strictEqual(await tierOfOffer(offers[0]), 16000, 'nothing stored');
+        session.close();
+        await negotiate({ tierKey: 'mac3', storage });
+        strictEqual(await tierOfOffer(offers[0]), 16000, 'not a tier');
+        session.close();
+        // An explicit start tier comes before the stored one.
+        await negotiate({ tierKey: 'mac1', storage, tier: 8000 });
+        strictEqual(await tierOfOffer(offers[0]), 8000);
+        session.close();
+        // Storage that refuses is no failure.
+        const refusing = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } };
+        await negotiate({ tierKey: 'mac1', storage: refusing });
+        strictEqual(await tierOfOffer(offers[0]), 16000);
+    });
+
+    it('stores the tier and reports it on every change', async () => {
+        const storage = fakeStorage();
+        const seen = [];
+        const keys = await stream({ tierKey: 'mac1', storage, onTier: t => seen.push(t) });
+        const feed = await lossyFeed(keys.video);
+        await feed(3);
+        pass(50);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        strictEqual(storage.getItem('ardHpTier:mac1'), '12000');
+        deepStrictEqual(seen, [12000]);
+        await answerReoffer();
+        strictEqual(session.setTier(6000), true);
+        strictEqual(storage.getItem('ardHpTier:mac1'), '6000');
+        deepStrictEqual(seen, [12000, 6000]);
+    });
+
+    it('takes only known tiers, and none above the cap', async () => {
+        create({ tier: 9999 });
+        strictEqual(session.tier, 16000);
+        session.close();
+        await stream({ maxKbit: 10000 });
+        strictEqual(session.tier, 10000);
+        strictEqual(session.setTier(9999), false);
+        strictEqual(session.setTier(0), false);
+        strictEqual(session.setTier(12000), false);
+        await settle();
+        strictEqual(session.tier, 10000);
+        strictEqual(offers.length, 1);
+        strictEqual(session.setTier(6000), true);
+        await until(() => offers.length === 2, 'the requested tier');
+        strictEqual(await tierOfOffer(offers[1]), 6000);
+    });
+
+    // ----- the agent's control frame -----
+
+    it('keeps agent control frames out of the media path and its liveness', async () => {
+        const warns = [];
+        const keys = await stream({ warn: m => warns.push(m) });
+        const audio = await createContext(keys.audio.fromServer.key, keys.audio.fromServer.salt);
+        ws.deliver(CHANNEL_AUDIO, await audio.protectRtp(audioPacket(1)));
+        await until(() => session.stats.audioPackets === 1, 'the audio packet');
+        const counts = () => [session.stats.videoPackets, session.stats.audioPackets,
+                              session.stats.rtcpPackets, session.stats.authFailures];
+        const before = counts();
+        // Frames every second, a malformed and an unknown version among them.
+        for (let i = 0; i < 3; i++) {
+            ws.deliver(2, controlFrame());
+            ws.deliver(2, controlFrame({ version: 2 }));
+            ws.deliver(2, new Uint8Array(3));
+            pass(1000);
+            await settle();
+        }
+        deepStrictEqual(counts(), before);
+        // They kept nothing alive: the silence is noticed as such.
+        pass(100);
+        await settle();
+        ok(warns.some(w => w.startsWith('glitch media-stopped')), warns.join('; '));
+        ok(!warns.some(w => w.startsWith('glitch stalled')));
+    });
+
+    it('steps down to a limiting agent budget, and not for a budget of 0', async () => {
+        await stream();
+        ws.deliver(2, controlFrame({ budgetKbit: 0 }));
+        pass(1000);
+        await settle();
+        strictEqual(offers.length, 1);
+        ws.deliver(2, controlFrame({ budgetKbit: 9000 }));
+        pass(1000);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        strictEqual(session.tier, 6000);
+        strictEqual(await tierOfOffer(offers[1]), 6000);
+    });
+
+    it('ignores an agent budget older than 3 s', async () => {
+        await negotiate();
+        ws.deliver(2, controlFrame({ budgetKbit: 9000 }));
+        pass(3100);
+        sinks[0].opts.onFirstFrame();
+        pass(1000);
+        await settle();
+        strictEqual(offers.length, 1);
+        strictEqual(session.tier, 16000);
     });
 
     it('closes quietly', async () => {

@@ -9,25 +9,29 @@
  * The RFB layer hands in Message 1 and the answer as they arrive on TCP and
  * sends the offer this session builds. Media travels on a second WebSocket
  * to the relay: each message is one channel byte (0 audio, 1 video) and one
- * UDP datagram.
+ * UDP datagram, or (channel 2) the agent's control frame.
+ *
+ * The bit-rate tier the offer asks for is the TierController's: sampled from
+ * receive stats, recoveries and the agent's budget, applied by re-offering.
  */
 
 import {
     parseMessage1, generateSecrets, buildOffer, parseAnswer, splitKeyBlock, parseStreamPorts,
-    parseStreamError, STREAM_ERROR_IN_USE,
+    parseStreamError, STREAM_ERROR_IN_USE, parseAgentControl, AGENT_CONTROL_CHANNEL,
 } from './negotiation.js';
 import { createContext } from './srtp.js';
 import { VideoAssembler } from './rtp-video.js';
 import { receiverReport, pictureAck, rateControl } from './feedback.js';
-import { RateController, EVAL_MS } from './rate-control.js';
+import { TierController } from './rate-tier.js';
 import { ReceiveStats } from './receive-stats.js';
-import { PAYLOAD_TYPE_HEVC, DEFAULT_TIER } from './offer-template.js';
+import { PAYLOAD_TYPE_HEVC, TIERS } from './offer-template.js';
 
 // WebSocket subprotocol a relay's media endpoint answers to.
 export const MEDIA_SUBPROTOCOL = 'ard-media';
 
 export const CHANNEL_AUDIO = 0;
 export const CHANNEL_VIDEO = 1;
+export const CHANNEL_CONTROL = AGENT_CONTROL_CHANNEL;
 
 /*
  * Whether the RFB connection carries on (in Standard) after a failure with
@@ -48,9 +52,12 @@ const ANSWER_MS = 5000;
 const FIRST_FRAME_MS = 5000;
 const REPORT_MS = 1000;
 const RATE_CONTROL_MS = 50;
-// A video packet seen within this window counts as "video flowing": the rate
-// controller only ramps while pictures arrive, and holds the ceiling when idle.
-const VIDEO_FLOW_MS = 500;
+// How often the tier controller is sampled.
+export const TIER_EVAL_MS = 1000;
+// The agent's budget counts only from a control frame this recent.
+const AGENT_CONTROL_MAX_AGE_MS = 3000;
+// Where the tier this browser last held for a Mac is kept, by tierKey.
+export const TIER_STORAGE_PREFIX = 'ardHpTier:';
 
 // Nothing can be dropped from the stream without spoiling what follows, so
 // a viewer that cannot keep up falls further and further behind. Half a
@@ -91,6 +98,14 @@ const RECOVERABLE = new Set(['stalled', 'media-stopped', 'overloaded']);
 const VIDEO_CLOCK = 90000;
 const AUDIO_CLOCK = 48000;
 
+function defaultStorage() {
+    try {
+        return globalThis.localStorage || null;
+    } catch (e) {
+        return null;    // storage blocked for this page
+    }
+}
+
 function isRtcp(packet) {
     return packet.length > 1 && packet[1] >= 192 && packet[1] <= 223;
 }
@@ -110,10 +125,16 @@ export class HpSession {
      * onState(state, reason): called on every state change
      * feedback:        { reports, acks, rateControl } — which RTCP to send
      * endpoint:        how the viewer describes itself in the offer
-     * tier:            video bit-rate tier in kbit/s the offer asks for (default 20000)
+     * tier:            a start tier (kbit/s) that overrides the stored one
+     * tierKey:         which Mac this is, for the stored tier (localStorage
+     *                  'ardHpTier:<tierKey>'); without it nothing is stored
+     * maxKbit:         operator cap on the tier
+     * onTier(tier):    called on every tier change
+     * storage:         localStorage stand-in (default globalThis.localStorage)
      */
     constructor({ mediaUrl, mediaChannel, sendOffer, holdOffer, createSink, createAudio, audioMuted, onState,
-                  onResize, feedback, endpoint, tier, WebSocketImpl, now, log, warn }) {
+                  onResize, feedback, endpoint, tier, tierKey, maxKbit, onTier, storage,
+                  WebSocketImpl, now, log, warn }) {
         this._mediaUrl = mediaUrl;
         this._mediaChannel = mediaChannel || null;
         this._sendOffer = sendOffer;
@@ -126,17 +147,29 @@ export class HpSession {
         this._onResize = onResize || (() => {});
         this._feedback = Object.assign({ reports: true, acks: true, rateControl: true }, feedback);
         this._endpoint = endpoint;
-        this.tier = Number.isFinite(tier) ? tier : DEFAULT_TIER;
         this._WebSocket = WebSocketImpl || globalThis.WebSocket;
         this._now = now || (() => performance.now());
         this._log = log || (() => {});
         this._warn = warn || this._log;
+        this._onTier = onTier || (() => {});
+        this._storage = storage !== undefined ? storage : defaultStorage();
+        this._tierKey = tierKey ? String(tierKey) : null;
+        this._maxKbit = maxKbit;
+
+        // Start: the tier asked for, else the one this browser last held
+        // for this Mac, else the controller's own; never above the cap.
+        const start = TIERS.includes(tier) ? tier : this._storedTier();
+        this._tierCtl = new TierController({ start: start === null ? undefined : start, maxKbit });
+        this.tier = this._tierCtl.tier;
+        this._tierWhy = null;               // what moved the controller last
+        this._lastTierEvalAt = null;
+        this._agentControl = null;          // last control frame, with its arrival time
 
         this.state = 'idle';
         this.failure = null;
         this.stats = {
             videoPackets: 0, videoBytes: 0, audioPackets: 0, audioBytes: 0, rtcpPackets: 0,
-            authFailures: 0, pictures: 0, keyPictures: 0, sent: 0,
+            authFailures: 0, pictures: 0, keyPictures: 0, sent: 0, controlFrames: 0,
         };
 
         this._ws = null;
@@ -147,11 +180,11 @@ export class HpSession {
         this._ctx = null;           // { audioIn, audioOut, videoIn, videoOut }
         this._assembler = null;
         this._sink = null;
-        this._reoffering = false;   // a resize re-offer is in flight
+        this._reoffering = false;   // a re-offer is in flight
+        this._reofferKind = null;   // 'resize', 'recovery' or 'tier'
         this._pendingSecrets = null;
         this._resizeSignalled = false;  // onResize(true) sent, onResize(false) owed
         this._resizeOldSink = null;     // kept alive until the new picture shows
-        this._recovering = false;       // the current re-offer is a recovery
         this._recoveryAt = [];          // recent recovery times, for the cap
         this._reofferGen = 0;           // which re-offer a pending timer belongs to
         this._timers = new Set();
@@ -164,8 +197,6 @@ export class HpSession {
         this._lastSenderReport = [null, null];   // per channel: { middle, at }
         this._decrypting = 0;                    // packets handed to SRTP and not back yet
         this._overloadedSince = null;
-        this._rateController = new RateController();
-        this._lastRateEvalAt = null;             // last time the estimator sampled
     }
 
     // The picture size and stripe count from the server's answer.
@@ -364,16 +395,17 @@ export class HpSession {
             this._fail(inUse ? 'in-use' : 'refused', 'error ' + error.type + '/' + error.subCode);
             return;
         }
-        // A re-offer sent during a session (a resize): swap the stream in
-        // without disturbing the picture on screen. Its failure is not the
-        // session's; the old stream stays.
+        // A re-offer sent during a session: swap the stream in without
+        // disturbing the picture on screen. A resize's failure is not the
+        // session's; the old stream stays. A recovery or a tier change has
+        // no stream to fall back on.
         if (this._reoffering && this.state === 'streaming') {
             this._swapMedia(payload).catch((e) => {
-                const recovery = this._recovering;
+                const fatal = this._reofferFatal();
                 this._log('re-offer answer failed: ' + (e && e.message ? e.message : e));
                 this._endReoffer();
                 this._resizeDone();
-                if (recovery) this._fail('bad-answer', e && e.message ? e.message : String(e));
+                if (fatal) this._fail('bad-answer', e && e.message ? e.message : String(e));
             });
             return;
         }
@@ -382,21 +414,34 @@ export class HpSession {
         this._startMedia(payload).catch(e => this._fail('bad-answer', e.message));
     }
 
-    // Ask the server for a new picture size on the open connection: send a
-    // fresh offer. The RFB layer has already sent the new VirtualDisplay
-    // (0x1d). The picture on screen stays until the new one is ready.
     // Ask for another bit-rate tier: a re-offer carrying it. False when it
-    // cannot go now (not streaming, or a re-offer is already under way).
-    setTier(tier) {
+    // cannot go now (not streaming, or a re-offer is already under way), or
+    // the tier is not one of TIERS or is above the operator cap. A tier
+    // asked for from outside becomes the controller's new starting point.
+    setTier(tier, reason = 'requested') {
+        if (!TIERS.includes(tier)) return false;
         if (this.state !== 'streaming' || this._reoffering) return false;
-        this.tier = tier;
-        this.reoffer();
+        if (tier !== this._tierCtl.tier) {
+            const ctl = new TierController({ start: tier, maxKbit: this._maxKbit });
+            if (ctl.tier !== tier) return false;
+            this._tierCtl = ctl;
+        }
+        this._adoptTier(tier, reason);
+        this._reoffer('tier');
         return true;
     }
 
+    // Ask the server for a new picture size on the open connection: send a
+    // fresh offer. The RFB layer has already sent the new VirtualDisplay
+    // (0x1d). The picture on screen stays until the new one is ready.
     reoffer() {
+        this._reoffer('resize');
+    }
+
+    _reoffer(kind) {
         if (this.state !== 'streaming' || this._reoffering) return;
         this._reoffering = true;
+        this._reofferKind = kind;
         const gen = ++this._reofferGen;
         // The switch gap is not silence and not a freeze.
         this._lastMediaAt = this._now();
@@ -409,20 +454,89 @@ export class HpSession {
             this._timeout(ANSWER_MS, () => {
                 // Only this re-offer's own timer acts; a later one has a new gen.
                 if (this._reofferGen !== gen || !this._reoffering) return;
-                const recovery = this._recovering;
-                this._log((recovery ? 'recovery' : 'resize') + ': no answer');
+                const kind = this._reofferKind;
+                const fatal = this._reofferFatal();
+                this._log(kind + ': no answer');
                 this._endReoffer();
                 this._resizeDone();
-                if (recovery) this._fail('media-stopped', 'recovery got no answer');
+                if (fatal) this._fail('media-stopped', kind + ' got no answer');
             });
         }, (e) => {
             if (this._reofferGen !== gen) return;
-            const recovery = this._recovering;
+            const fatal = this._reofferFatal();
             this._log('re-offer failed: ' + e.message);
             this._endReoffer();
             this._resizeDone();
-            if (recovery) this._fail('offer', e.message);
+            if (fatal) this._fail('offer', e.message);
         });
+    }
+
+    // A resize leaves the old stream running when it fails. A recovery or a
+    // tier change has asked the server to restart its media, so it does not.
+    _reofferFatal() {
+        return this._reofferKind !== 'resize';
+    }
+
+    // ----- the bit-rate tier -----
+
+    // The tier this browser last held for this Mac, or null.
+    _storedTier() {
+        if (!this._tierKey || !this._storage) return null;
+        try {
+            const raw = this._storage.getItem(TIER_STORAGE_PREFIX + this._tierKey);
+            const tier = raw === null ? NaN : Number(raw);
+            return TIERS.includes(tier) ? tier : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // The tier the session now offers: logged, stored, reported.
+    _adoptTier(tier, reason) {
+        if (tier === this.tier) return;
+        this._log('tier ' + this.tier + ' -> ' + tier + ' kbit/s (' + reason + ')');
+        this.tier = tier;
+        if (this._tierKey && this._storage) {
+            try {
+                this._storage.setItem(TIER_STORAGE_PREFIX + this._tierKey, String(tier));
+            } catch (e) { /* storage blocked: the tier still applies */ }
+        }
+        this._onTier(tier);
+    }
+
+    // The agent's budget from its last control frame: limiting when it
+    // names a rate, not limiting when 0, and nothing when too old.
+    _agentBudget(now) {
+        const c = this._agentControl;
+        if (!c || now - c.at > AGENT_CONTROL_MAX_AGE_MS) return null;
+        return c.budgetKbit > 0 ? { kbit: c.budgetKbit, limiting: true } : { kbit: 0, limiting: false };
+    }
+
+    // One controller sample; `recovery` names the glitch being recovered
+    // from, if any. Remembers what moved it, for the log.
+    _sampleTier(now, recovery) {
+        this._lastTierEvalAt = now;
+        const w = this._recvStats.window(now);
+        const budget = this._agentBudget(now);
+        const from = this._tierCtl.tier;
+        const next = this._tierCtl.sample({ now, ...w, budget, recovery: !!recovery });
+        if (next === null) return;
+        this._tierWhy = (next < from ? 'down' : 'up') + ': ' +
+            (recovery ? 'recovery from ' + recovery + ', ' : '') +
+            'loss ' + w.lossPct.toFixed(1) + '%, delay ' + Math.round(w.queueDelayMs) + ' ms, video ' +
+            Math.round(w.videoKbit) + ' kbit/s, ' +
+            (!budget ? 'no budget' : budget.limiting ? 'budget ' + budget.kbit + ' kbit/s' : 'budget not limiting');
+    }
+
+    // Every tick while streaming: sample on TIER_EVAL_MS, and put the
+    // controller's tier into effect. A change that cannot go now is kept and
+    // tried again on the next tick.
+    _driveTier(now) {
+        if (this.state !== 'streaming' || this._reoffering) return;
+        if (this._lastTierEvalAt === null || now - this._lastTierEvalAt >= TIER_EVAL_MS) {
+            this._sampleTier(now, null);
+        }
+        if (this._tierCtl.tier !== this.tier) this.setTier(this._tierCtl.tier, this._tierWhy || 'controller');
     }
 
     // A glitch while streaming: re-offer to restart the media on the open
@@ -457,22 +571,25 @@ export class HpSession {
             this._recoveryAt.push(now);
             this._warn('recovering from ' + reason + (detail ? ' (' + detail + ')' : '') +
                        ', attempt ' + this._recoveryAt.length + ' of ' + RECOVERY_MAX);
-            this._recovering = true;
             this._overloadedSince = null;   // give the fresh stream a clean slate
-            this.reoffer();
+            // A recovery is a down trigger: its re-offer asks for the
+            // controller's tier (one lower, unless a down was just made).
+            this._sampleTier(now, reason);
+            this._adoptTier(this._tierCtl.tier, this._tierWhy || 'recovery from ' + reason);
+            this._reoffer('recovery');
             return;
         }
         this._fail(reason, detail);
     }
 
-    // A resize re-offer is in flight: a second one must wait for it.
+    // A re-offer is in flight: a second one must wait for it.
     reoffering() {
         return this._reoffering;
     }
 
     _endReoffer() {
         this._reoffering = false;
-        this._recovering = false;
+        this._reofferKind = null;
         this._pendingSecrets = null;
     }
 
@@ -544,17 +661,14 @@ export class HpSession {
         this._lastMediaAt = this._now();
         this._lastVideoPacketAt = this._now();
         this._lastPictureAt = this._now();
-        // The reconfigured stream rebuilds the assembler (skipped restarts at
-        // 0), so the estimate re-probes from the ceiling rather than carrying a
-        // stale low value into the new size.
-        this._rateController.reset();
-        this._lastRateEvalAt = null;
         // The audio stream restarts with a new SSRC and sequence; let its
         // reorder take the new numbers, or every packet reads as late.
         if (this._audio && this._audio.resetStream) this._audio.resetStream();
+        const kind = this._reofferKind;
         this._endReoffer();
-        this._log('resized to ' + answer.video.width + 'x' + answer.video.height +
-                  ', ' + answer.video.stripes + ' stripes');
+        this._log((kind === 'resize' ? 'resized to ' : kind + ' re-offer answered: ') +
+                  answer.video.width + 'x' + answer.video.height +
+                  ', ' + answer.video.stripes + ' stripes, tier ' + this.tier + ' kbit/s');
     }
 
     async _startMedia(payload) {
@@ -577,12 +691,6 @@ export class HpSession {
             onPicture: p => this._onPicture(p),
             onStall: s => this._streamingFail('stalled', 'waiting for picture ' + s.expectedDon),
         });
-        // A fresh assembler means a fresh loss history: re-probe from the
-        // ceiling, the same as _swapMedia does when it rebuilds the assembler.
-        // (The constructor already starts here, but reset keeps the rule — a
-        // new assembler resets the estimator — stated at both build sites.)
-        this._rateController.reset();
-        this._lastRateEvalAt = null;
         this._sink = this._createSink({
             width: answer.video.width,
             height: answer.video.height,
@@ -629,6 +737,13 @@ export class HpSession {
     _onMedia(data) {
         if (!this._loggedRecv) { this._loggedRecv = true; this._log('HP first media RECV bytes=' + (data.byteLength || data.length)); }
         if (this.state === 'failed' || this.state === 'closed') return;
+        const bytes = new Uint8Array(data);
+        // The agent's control frame is not media: it never reaches the
+        // decryption, and it is no sign that the server is still sending.
+        if (bytes.length > 0 && bytes[0] === CHANNEL_CONTROL) {
+            this._onAgentControl(bytes);
+            return;
+        }
         if (!this._ctx) {
             // The server may start before our keys are ready.
             if (this.state === 'offering') {
@@ -637,7 +752,6 @@ export class HpSession {
             }
             return;
         }
-        const bytes = new Uint8Array(data);
         if (bytes.length < 13) return;
         const channel = bytes[0];
         const packet = bytes.subarray(1);
@@ -692,6 +806,17 @@ export class HpSession {
             this._decrypting--;
             this.stats.authFailures++;
         });
+    }
+
+    _onAgentControl(bytes) {
+        const frame = parseAgentControl(bytes);
+        if (!frame) return;
+        this.stats.controlFrames++;
+        if (!this._agentControl) {
+            this._log('agent control: budget ' + frame.budgetKbit + ' kbit/s, queue ' + frame.queueMs +
+                      ' ms, rtt ' + frame.rttMs + ' ms, loss ' + frame.lossPermille + '‰');
+        }
+        this._agentControl = Object.assign({ at: this._now() }, frame);
     }
 
     _onPicture(picture) {
@@ -754,24 +879,16 @@ export class HpSession {
             now - this._lastPictureAt > PICTURE_STALL_MS) {
             this._streamingFail('stalled', 'no new picture');
         }
+        this._driveTier(now);
         if (!this._feedback.rateControl || this.state === 'failed') return;
         const sinceLast = this._lastVideoPacketAt === null ? 0 : now - this._lastVideoPacketAt;
-        // The report still goes out every tick (RATE_CONTROL_MS); only the
-        // bandwidth estimate is re-evaluated on the slower EVAL_MS cadence.
-        if (this._lastRateEvalAt === null || now - this._lastRateEvalAt >= EVAL_MS) {
-            this._lastRateEvalAt = now;
-            const videoFlowing = this._lastVideoPacketAt !== null && sinceLast <= VIDEO_FLOW_MS;
-            this._rateController.sample({
-                skipped: (this._assembler && this._assembler.diag && this._assembler.diag.skipped) || 0,
-                videoFlowing,
-            });
-        }
+        // Field D is the tier asked for (the Mac does not act on it).
         this._sendRtcp(CHANNEL_VIDEO, rateControl({
             ssrc: this._secrets.videoSsrc,
             a: this.stats.pictures & 0xffff,
             b: sinceLast,
             c: this.stats.videoPackets,
-            d: this._rateController.estimate(),
+            d: this.tier,
         }));
     }
 

@@ -288,3 +288,35 @@ export async function parseAnswer(payload) {
         },
     };
 }
+
+/*
+ * The agent's control frame: channel 2 on the media channel, target to
+ * browser only, about once a second. The whole message, channel byte
+ * included, big-endian:
+ *
+ *   0    1   channel (2)
+ *   1    1   version (1)
+ *   2    4   budgetKbit    0: the path is not limiting, or nothing is known
+ *   6    2   queueMs
+ *   8    2   rttMs
+ *  10    2   lossPermille
+ *  12    4   dropsDelta    frames the carriage dropped since the last frame
+ *
+ * Returns the fields, or null for another length, channel or version.
+ */
+export const AGENT_CONTROL_CHANNEL = 2;
+const AGENT_CONTROL_VERSION = 1;
+const AGENT_CONTROL_LENGTH = 16;
+
+export function parseAgentControl(frame) {
+    if (!frame || frame.length !== AGENT_CONTROL_LENGTH) return null;
+    if (frame[0] !== AGENT_CONTROL_CHANNEL || frame[1] !== AGENT_CONTROL_VERSION) return null;
+    const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    return {
+        budgetKbit: view.getUint32(2),
+        queueMs: view.getUint16(6),
+        rttMs: view.getUint16(8),
+        lossPermille: view.getUint16(10),
+        dropsDelta: view.getUint32(12),
+    };
+}

@@ -1690,7 +1690,14 @@ RFB.prototype._ardHpStart = function () {
         holdOffer,
         feedback: this._ardHpFeedback,
         endpoint: this._ardHpEndpoint,
+        // An explicit start tier (ardHpSetTier, the live gate) wins over the
+        // one stored for this Mac.
         tier: this._ardHpTier,
+        // Which Mac this is, for the tier this browser last held for it: the
+        // embedder's device identity, else the desktop name.
+        tierKey: this._ardHpTierKey || this._fbName || null,
+        maxKbit: this._ardHpMaxKbit,
+        onTier: () => ardUpdateInfoPanel(this),
         sendOffer: bytes => RFB.messages.ardMediaStreamNegotiation(this._sock, bytes),
         createSink: opts => new VideoSink(Object.assign({
             target: this._canvas,
@@ -1748,7 +1755,7 @@ RFB.prototype._ardHpOnState = function (state, reason) {
             reason: reason || null,
             failure: session ? session.failure : null,
             video: session ? session.video : null,
-            stats: session ? Object.assign({}, session.stats) : null,
+            stats: session ? Object.assign({}, session.stats, { tier: session.tier }) : null,
         }
     }));
     ardUpdateInfoPanel(this);
@@ -1811,6 +1818,12 @@ Object.defineProperty(RFB.prototype, 'ardAudioMuted', {
 // Whether High Performance media is on screen.
 Object.defineProperty(RFB.prototype, 'ardHighPerformanceActive', {
     get() { return !!this._ardHp && this._ardHp.state === 'streaming'; },
+    configurable: true,
+});
+
+// The video bit-rate tier (kbit/s) High Performance asks for; null without it.
+Object.defineProperty(RFB.prototype, 'ardHpTier', {
+    get() { return this._ardHp ? this._ardHp.tier : null; },
     configurable: true,
 });
 
@@ -2834,7 +2847,9 @@ function ardUpdateInfoPanel(rfb) {
     const qualityLabels = { halftone: 'Halftone', gray: 'Gray16', thousands: 'Thousands', millions: 'Full Color', adaptive: 'Adaptive' };
     let quality = qualityLabels[rfb._ardQualityPreset] || rfb._ardQualityPreset;
     if (rfb._ardQualityPreset === 'highperf') {
-        quality = rfb._ardHp ? 'High Performance (' + rfb._ardHp.state + ')' : 'Adaptive (High Performance unavailable)';
+        quality = rfb._ardHp
+            ? 'High Performance (' + rfb._ardHp.state + ', ' + rfb._ardHp.tier / 1000 + ' Mbit/s)'
+            : 'Adaptive (High Performance unavailable)';
     }
     set('ard_info_quality', quality);
     const modeLabels = { 0: 'Observe', 1: 'Control', 2: 'Exclusive' };

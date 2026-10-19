@@ -13,7 +13,7 @@ import * as plist from '../hp/plist.js';
 import { deflate, inflate } from '../hp/zlib.js';
 import {
     parseMessage1, generateSecrets, splitKeyBlock, buildOffer, parseAnswer, parseStreamPorts, parseStreamError,
-    ntpFromUnixMs, KEY_BLOCK_LENGTH,
+    ntpFromUnixMs, KEY_BLOCK_LENGTH, parseAgentControl, AGENT_CONTROL_CHANNEL,
 } from '../hp/negotiation.js';
 import { tableFields, TIERS, DEFAULT_TIER } from '../hp/offer-template.js';
 
@@ -341,5 +341,36 @@ describe('Offer table tiers', () => {
             [2400000, 8000000, 16000000, 24000000, 30000000, 40000000]);
         deepStrictEqual(r.slice(4).map(x => x[2]), base.slice(4).map(x => x[2]));
         deepStrictEqual(r.slice(4).map(x => x[0]), Array(6).fill(0));
+    });
+});
+
+// Channel 2: the agent's once-a-second control frame, target to browser.
+describe('Agent control frame', () => {
+    // [2][version 1][budgetKbit u32][queueMs u16][rttMs u16][lossPermille u16][dropsDelta u32]
+    const FRAME = new Uint8Array([
+        2, 1, 0x00, 0x00, 0x2e, 0xe0, 0x00, 0x96, 0x01, 0x2c, 0x00, 0x1e, 0x80, 0x00, 0x00, 0x07]);
+
+    it('reads every field, big-endian', () => {
+        strictEqual(AGENT_CONTROL_CHANNEL, 2);
+        deepStrictEqual(parseAgentControl(FRAME),
+            { budgetKbit: 12000, queueMs: 150, rttMs: 300, lossPermille: 30, dropsDelta: 0x80000007 });
+    });
+
+    it('reads a frame that is not at the start of its buffer', () => {
+        const buf = new Uint8Array(20);
+        buf.set(FRAME, 4);
+        strictEqual(parseAgentControl(buf.subarray(4)).budgetKbit, 12000);
+    });
+
+    it('rejects the wrong length, another channel or another version', () => {
+        strictEqual(parseAgentControl(FRAME.subarray(0, 15)), null);
+        strictEqual(parseAgentControl(new Uint8Array([...FRAME, 0])), null);
+        const v2 = FRAME.slice();
+        v2[1] = 2;
+        strictEqual(parseAgentControl(v2), null);
+        const ch1 = FRAME.slice();
+        ch1[0] = 1;
+        strictEqual(parseAgentControl(ch1), null);
+        strictEqual(parseAgentControl(new Uint8Array(0)), null);
     });
 });
