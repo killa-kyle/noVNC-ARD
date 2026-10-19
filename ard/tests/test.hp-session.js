@@ -18,6 +18,7 @@ import { splitKeyBlock } from '../hp/negotiation.js';
 import { pictureAck } from '../hp/feedback.js';
 import {
     HpSession, CHANNEL_AUDIO, CHANNEL_VIDEO, hpFailureKeepsSession, TIER_GRACE_MS, TIER_STORED_MAX_AGE_MS,
+    TIER_STORED_MAX_AHEAD_MS, TIER_PERSIST_DOWN_MS,
 } from '../hp/session.js';
 import { codecFromAnnexB, splitAnnexB, DEFAULT_CODEC } from '../hp/hevc.js';
 import { overlayGeometry } from '../hp/video-sink.js';
@@ -1102,12 +1103,21 @@ describe('High Performance session', () => {
     // feed(count, gap) sends `count`, each `gap` sequence numbers past the
     // last: loss as receive stats count it, while every picture completes.
     // With `spreadMs` the packets share one RTP time and come that far
-    // apart, as the packets of one large picture do.
+    // apart, as the packets of one large picture do. feed.packet() is the
+    // next picture's datagram, timestamped now, for the caller to deliver.
     async function videoFeed(videoKeys) {
         const server = await createContext(videoKeys.fromServer.key, videoKeys.fromServer.salt);
         const t0 = Date.now();
         let seq = 100, don = 1, first = true;
-        return async (count, gap = 0, spreadMs = null) => {
+        const packet = () => {
+            if (!first) seq++;
+            first = false;
+            const ts = Math.round((Date.now() - t0) * 90) >>> 0;
+            const p = keyPicturePacket({ stripe: 0, seq: seq & 0xffff, don, frame: don, ts });
+            don++;
+            return server.protectRtp(p);
+        };
+        const feed = async (count, gap = 0, spreadMs = null) => {
             const before = session.stats.videoPackets;
             const pictureTs = Math.round((Date.now() - t0) * 90) >>> 0;
             for (let i = 0; i < count; i++) {
@@ -1124,6 +1134,8 @@ describe('High Performance session', () => {
             }
             await until(() => session.stats.videoPackets === before + count, count + ' video packets');
         };
+        feed.packet = packet;
+        return feed;
     }
 
     // A clean picture a second until the start grace is over.
@@ -1252,24 +1264,32 @@ describe('High Performance session', () => {
         const keys = await stream();
         const feed = await videoFeed(keys.video);
         await pastGrace(feed);
-        // The next picture arrives on time, but its decryption is held up
-        // for 500 ms (a busy machine).
+        // Pictures arrive on time, 60 a second, but their decryption is held
+        // up for 500 ms (a busy machine), then finishes in order.
         const ctx = session._ctx.videoIn;
         const unprotect = ctx.unprotectRtp.bind(ctx);
-        let started = false, release;
+        let release, chain = Promise.resolve(), started = 0;
         const gate = new Promise((resolve) => { release = resolve; });
-        ctx.unprotectRtp = async (packet) => {
-            started = true;
-            const rtp = await unprotect(packet);
-            await gate;
-            return rtp;
+        ctx.unprotectRtp = (packet) => {
+            started++;
+            const rtp = unprotect(packet);
+            chain = chain.then(() => gate).then(() => rtp);
+            return chain;
         };
-        const done = feed(1);
-        await until(() => started, 'the decryption to start');
+        const before = session.stats.videoPackets;
+        const count = 12;
+        for (let i = 0; i < count; i++) {
+            ws.deliver(CHANNEL_VIDEO, await feed.packet());
+            await until(() => started === i + 1, 'the decryption to start');
+            mock.timers.tick(17);
+        }
         mock.timers.tick(500);
         release();
-        await done;
+        await until(() => session.stats.videoPackets === before + count, 'the held pictures');
         ctx.unprotectRtp = unprotect;
+        // Timed at decryption these would be a standing queue of 500 ms.
+        ok(session._recvStats.window(Date.now()).queueDelayMs < 50,
+           'got ' + session._recvStats.window(Date.now()).queueDelayMs);
         pass(1000);
         await settle();
         strictEqual(offers.length, 1, 'no down for a delay of our own making');
@@ -1340,6 +1360,8 @@ describe('High Performance session', () => {
             'ardHpTier:mac1': stored(10000),
             'ardHpTier:mac3': stored(9999),
             'ardHpTier:old': stored(10000, TIER_STORED_MAX_AGE_MS + 1),
+            'ardHpTier:ahead': stored(10000, -(TIER_STORED_MAX_AHEAD_MS + 1000)),
+            'ardHpTier:skewed': stored(10000, -(TIER_STORED_MAX_AHEAD_MS - 1000)),
             'ardHpTier:legacy': '8000',
             'ardHpTier:junk': '{',
         });
@@ -1354,6 +1376,8 @@ describe('High Performance session', () => {
         strictEqual(await startTier({ tierKey: 'mac2' }), 16000, 'nothing stored');
         strictEqual(await startTier({ tierKey: 'mac3' }), 16000, 'not a tier');
         strictEqual(await startTier({ tierKey: 'old' }), 16000, 'older than a day');
+        strictEqual(await startTier({ tierKey: 'ahead' }), 16000, 'from the future');
+        strictEqual(await startTier({ tierKey: 'skewed' }), 10000, 'a clock a little ahead');
         strictEqual(await startTier({ tierKey: 'legacy' }), 8000, 'a bare number from an earlier build');
         strictEqual(await startTier({ tierKey: 'junk' }), 16000, 'not JSON');
         // An explicit start tier comes before the stored one.
@@ -1363,18 +1387,52 @@ describe('High Performance session', () => {
         strictEqual(await startTier({ tierKey: 'mac1', storage: refusing }), 16000);
     });
 
-    it('stores the tier with its time and reports it on every change', async () => {
+    it('stores a down once it has streamed 10 s, an up at once, and reports every change', async () => {
         const storage = fakeStorage();
         const seen = [];
         const warns = [];
         await lossDown({ tierKey: 'mac1', storage, onTier: t => seen.push(t), warn: m => warns.push(m) });
-        deepStrictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')), { tier: 12000, at: Date.now() });
         deepStrictEqual(seen, [12000]);
         ok(warns.some(w => w.startsWith('tier 16000 -> 12000 kbit/s (down: ')), warns.join('; '));
+        strictEqual(storage.getItem('ardHpTier:mac1'), null, 'a down is not stored yet');
         await answerReoffer();
-        strictEqual(session.setTier(6000), true);
-        strictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')).tier, 6000);
-        deepStrictEqual(seen, [12000, 6000]);
+        const feed2 = await videoFeed(keysFromOffer(offers[1]).video);
+        for (let t = 1000; t < TIER_PERSIST_DOWN_MS; t += 1000) {
+            await feed2(1);
+            pass(1000);
+            await settle();
+        }
+        strictEqual(storage.getItem('ardHpTier:mac1'), null, 'nor after 9 s of the new tier');
+        await feed2(1);
+        pass(1000);
+        await settle();
+        const kept = JSON.parse(storage.getItem('ardHpTier:mac1'));
+        strictEqual(kept.tier, 12000);
+        ok(Math.abs(kept.at - Date.now()) <= 1000, 'stored with its time');
+        strictEqual(session.setTier(16000), true);
+        strictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')).tier, 16000, 'an up is stored at once');
+        deepStrictEqual(seen, [12000, 16000]);
+    });
+
+    it('does not store the downs of a session that dies inside 10 s', async () => {
+        const storage = fakeStorage({ 'ardHpTier:mac1': JSON.stringify({ tier: 16000, at: Date.now() }) });
+        const seen = [];
+        await lossDown({ tierKey: 'mac1', storage, onTier: t => seen.push(t) });
+        await answerReoffer();
+        const feed2 = await videoFeed(keysFromOffer(offers[1]).video);
+        await feed2(1);
+        pass(1000);
+        await settle();
+        await feed2(1);
+        // Then nothing more: past 4 s from the down, a recovery a tier
+        // lower, never answered.
+        pass(3100);
+        await until(() => offers.length === 3, 'the recovery re-offer');
+        mock.timers.tick(5000);
+        await settle();
+        strictEqual(session.state, 'failed');
+        deepStrictEqual(seen, [12000, 8000]);
+        strictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')).tier, 16000);
     });
 
     it('takes only known tiers, and none above the cap', async () => {

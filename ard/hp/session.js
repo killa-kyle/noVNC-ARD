@@ -60,6 +60,11 @@ export const TIER_EVAL_MS = 1000;
 export const TIER_GRACE_MS = 3000;
 // A stored tier older than this is not this path's any more.
 export const TIER_STORED_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// A stored tier from further ahead than this is from a wrong clock.
+export const TIER_STORED_MAX_AHEAD_MS = 60 * 1000;
+// A lower tier is stored only once it has streamed this long: the downs of
+// a session that is dying are no lesson for the next one.
+export const TIER_PERSIST_DOWN_MS = 10000;
 // The agent's budget counts only from a control frame this recent.
 const AGENT_CONTROL_MAX_AGE_MS = 3000;
 // Where the tier this browser last held for a Mac is kept, by tierKey.
@@ -133,7 +138,9 @@ export class HpSession {
      * endpoint:        how the viewer describes itself in the offer
      * tier:            a start tier (kbit/s) that overrides the stored one
      * tierKey:         which Mac this is, for the stored tier (localStorage
-     *                  'ardHpTier:<tierKey>'); without it nothing is stored
+     *                  'ardHpTier:<tierKey>'); without it nothing is stored.
+     *                  A higher tier is stored at once, a lower one once it
+     *                  has streamed TIER_PERSIST_DOWN_MS
      * maxKbit:         operator cap on the tier
      * onTier(tier):    called on every tier change
      * storage:         localStorage stand-in (default globalThis.localStorage)
@@ -168,6 +175,7 @@ export class HpSession {
         this._tierCtl = new TierController({ start: start === null ? undefined : start, maxKbit });
         this.tier = this._tierCtl.tier;
         this._tierWhy = null;               // what moved the controller last
+        this._tierToStore = null;           // a lower tier not yet stored: { tier, at }
         this._lastTierEvalAt = null;
         this._streamStartAt = null;         // when the current stream began, for TIER_GRACE_MS
         this._agentControl = null;          // last control frame, with its arrival time
@@ -496,7 +504,7 @@ export class HpSession {
 
     // The tier this browser last held for this Mac within the last day, or
     // null. Stored as {"tier", "at" (Unix ms)}; a bare number (an earlier
-    // build) is taken without an age.
+    // build) is taken without an age. A time well in the future is no time.
     _storedTier() {
         if (!this._tierKey || !this._storage) return null;
         let value;
@@ -509,22 +517,46 @@ export class HpSession {
         }
         if (typeof value === 'number') return TIERS.includes(value) ? value : null;
         if (!value || typeof value !== 'object' || !TIERS.includes(value.tier)) return null;
-        if (!Number.isFinite(value.at) || Date.now() - value.at > TIER_STORED_MAX_AGE_MS) return null;
+        const age = Number.isFinite(value.at) ? Date.now() - value.at : NaN;
+        if (!(age <= TIER_STORED_MAX_AGE_MS && age >= -TIER_STORED_MAX_AHEAD_MS)) return null;
         return value.tier;
     }
 
-    // The tier the session now offers: logged, stored, reported.
+    _storeTier(tier) {
+        if (!this._tierKey || !this._storage) return;
+        try {
+            this._storage.setItem(TIER_STORAGE_PREFIX + this._tierKey,
+                                  JSON.stringify({ tier, at: Date.now() }));
+        } catch (e) { /* storage blocked: the tier still applies */ }
+    }
+
+    // The tier the session now offers: logged, reported, and stored — at
+    // once if higher, once it has streamed TIER_PERSIST_DOWN_MS if lower.
     _adoptTier(tier, reason) {
         if (tier === this.tier) return;
         this._warn('tier ' + this.tier + ' -> ' + tier + ' kbit/s (' + reason + ')');
+        const down = tier < this.tier;
         this.tier = tier;
-        if (this._tierKey && this._storage) {
-            try {
-                this._storage.setItem(TIER_STORAGE_PREFIX + this._tierKey,
-                                      JSON.stringify({ tier, at: Date.now() }));
-            } catch (e) { /* storage blocked: the tier still applies */ }
+        if (down) {
+            this._tierToStore = { tier, at: this._now() };
+        } else {
+            this._tierToStore = null;
+            this._storeTier(tier);
         }
         this._onTier(tier);
+    }
+
+    // Store a lower tier once it has streamed TIER_PERSIST_DOWN_MS without
+    // a break: counted from the later of the down and the stream's start,
+    // and only while streaming with no re-offer out.
+    _storeTierWhenProven(now) {
+        const pending = this._tierToStore;
+        if (!pending) return;
+        if (pending.tier !== this.tier) { this._tierToStore = null; return; }
+        const since = Math.max(pending.at, this._streamStartAt === null ? pending.at : this._streamStartAt);
+        if (now - since < TIER_PERSIST_DOWN_MS) return;
+        this._tierToStore = null;
+        this._storeTier(pending.tier);
     }
 
     // The agent's budget from its last control frame: limiting when it
@@ -563,6 +595,7 @@ export class HpSession {
     // tried again on the next tick.
     _driveTier(now) {
         if (this.state !== 'streaming' || this._reoffering) return;
+        this._storeTierWhenProven(now);
         if (this._lastTierEvalAt === null || now - this._lastTierEvalAt >= TIER_EVAL_MS) {
             this._sampleTier(now, null);
         }
