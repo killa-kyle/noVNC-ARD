@@ -21,7 +21,7 @@ import {
 } from './negotiation.js';
 import { createContext } from './srtp.js';
 import { VideoAssembler } from './rtp-video.js';
-import { receiverReport, pictureAck, rateControl } from './feedback.js';
+import { receiverReport, pictureAck, rateControl, pli, fir } from './feedback.js';
 import { TierController } from './rate-tier.js';
 import { ReceiveStats } from './receive-stats.js';
 import { PAYLOAD_TYPE_HEVC, TIERS } from './offer-template.js';
@@ -85,13 +85,24 @@ const OVERLOAD_MS = 2000;
 // picture would stay as it was, looking alive.
 const MEDIA_SILENCE_MS = 3000;
 
-// The server sends video continuously in High Performance, even an idle
-// screen. So this long with no new *completed picture* — whether the packets
-// stopped, or they keep coming but the assembler cannot finish a picture
-// (a lost stripe), or the decoder is starved — means the picture is frozen.
-// Watching finished pictures, not packets, catches a freeze that still has a
-// full byte stream (seen at the largest sizes, with sound masking it).
+// This long with no new *completed picture* while video packets keep coming
+// means the picture is frozen: bytes flow but never finish a picture. That
+// is a freeze with a full byte stream (seen at the largest sizes, with sound
+// masking it). No video at all is not one: at low rates the Mac sends none
+// for a still screen (it drops repeated frames), and a server that stopped
+// is the MEDIA_SILENCE_MS watchdog's. A lost picture is the key wait's,
+// with its own limit (KEY_WAIT_MS).
 const PICTURE_STALL_MS = 3000;
+
+// The Mac sends a key picture only when a stream starts, so a lost picture
+// leaves nothing to decode from until it is asked for one. A stream with no
+// key picture this long after its first video packet asks too.
+export const KEY_FIRST_MS = 1000;
+// While waiting, ask again this often: FIR, then PLI, by turns.
+export const KEY_RETRY_MS = 300;
+// No key picture this long after the first request: the stream is stuck,
+// and the session recovers by re-offering.
+export const KEY_WAIT_MS = 2000;
 
 // After a resize, how long to keep the old picture (blurred) waiting for the
 // new one to be fully drawn before showing the new stream regardless.
@@ -185,6 +196,7 @@ export class HpSession {
         this.stats = {
             videoPackets: 0, videoBytes: 0, audioPackets: 0, audioBytes: 0, rtcpPackets: 0,
             authFailures: 0, pictures: 0, keyPictures: 0, sent: 0, controlFrames: 0, controlRejected: 0,
+            keyRequests: 0, keyWaits: 0, keyAnswered: 0,
         };
 
         this._ws = null;
@@ -212,6 +224,11 @@ export class HpSession {
         this._lastSenderReport = [null, null];   // per channel: { middle, at }
         this._decrypting = 0;                    // packets handed to SRTP and not back yet
         this._overloadedSince = null;
+        // Asking for a key picture, per live stream.
+        this._keyWait = null;                    // { reason, at, requests, retries } while asking
+        this._firSeq = 0;                        // the last FIR's sequence number
+        this._streamVideoAt = null;              // the stream's first video packet
+        this._streamKeySeen = false;             // the stream has had a key picture
     }
 
     // The picture size and stripe count from the server's answer.
@@ -457,6 +474,9 @@ export class HpSession {
         if (this.state !== 'streaming' || this._reoffering) return;
         this._reoffering = true;
         this._reofferKind = kind;
+        // The new stream will start with a key picture; asking the old one
+        // for one is moot, and its wait is no reason to recover.
+        this._keyWait = null;
         const gen = ++this._reofferGen;
         // The switch gap is not silence and not a freeze.
         this._lastMediaAt = this._now();
@@ -613,7 +633,7 @@ export class HpSession {
         return 'decrypting=' + this._decrypting + ' authFail=' + this.stats.authFailures +
             ' vpkts=' + this.stats.videoPackets + ' pics=' + this.stats.pictures +
             ' | asm buffered=' + a.buffered + ' next=' + a.next +
-            ' stalled=' + a.stalled + ' ignored=' + a.ignored + ' malformed=' + a.malformed +
+            ' waitingKey=' + a.waitingKey + ' ignored=' + a.ignored + ' malformed=' + a.malformed +
             ' dup=' + a.duplicates + ' emitted=' + a.emitted + ' skipped=' + a.skipped +
             ' | sink submitted=' + ss.submitted + ' decoded=' + ss.decoded +
             ' dropped=' + ss.dropped + ' backlog=' + backlog;
@@ -682,7 +702,10 @@ export class HpSession {
             baseSsrc: answer.video.ssrc,
             stripes: answer.video.stripes,
             onPicture: p => this._onPicture(p),
-            onStall: s => this._log('resize: waiting for picture ' + s.expectedDon),
+            onNeedKey: (s) => {
+                this._log('resize: waiting for picture ' + s.expectedDon);
+                this._startKeyWait('waiting for picture ' + s.expectedDon);
+            },
         });
         // The old picture stays, blurred, until the new size is really on
         // screen: a whole first picture painted and composited. A safety
@@ -725,6 +748,9 @@ export class HpSession {
         this._lastVideoPacketAt = this._now();
         this._lastPictureAt = this._now();
         this._streamStartAt = this._now();
+        // Its first-key timer starts from its own first video packet.
+        this._streamVideoAt = null;
+        this._streamKeySeen = false;
         // The audio stream restarts with a new SSRC and sequence; let its
         // reorder take the new numbers, or every packet reads as late.
         if (this._audio && this._audio.resetStream) this._audio.resetStream();
@@ -753,7 +779,7 @@ export class HpSession {
             baseSsrc: answer.video.ssrc,
             stripes: answer.video.stripes,
             onPicture: p => this._onPicture(p),
-            onStall: s => this._streamingFail('stalled', 'waiting for picture ' + s.expectedDon),
+            onNeedKey: s => this._startKeyWait('waiting for picture ' + s.expectedDon),
         });
         this._sink = this._createSink({
             width: answer.video.width,
@@ -865,6 +891,7 @@ export class HpSession {
             this.stats.videoPackets++;
             this.stats.videoBytes += rtp.payload.length;
             this._lastVideoPacketAt = this._now();
+            if (this._streamVideoAt === null) this._streamVideoAt = now;
             this._recvStats.onPacket({
                 ssrc: rtp.ssrc, seq: rtp.seq, rtpTs: rtp.timestamp, clockRate: VIDEO_CLOCK,
                 bytes: rtp.payload.length, now, video: true,
@@ -893,13 +920,82 @@ export class HpSession {
     _onPicture(picture) {
         this.stats.pictures++;
         this._lastPictureAt = this._now();
-        if (picture.key) this.stats.keyPictures++;
+        if (picture.key) {
+            this.stats.keyPictures++;
+            this._streamKeySeen = true;
+            const w = this._keyWait;
+            if (w) {
+                this._keyWait = null;
+                this.stats.keyAnswered++;
+                this._warn('key picture after ' + Math.round(this._now() - w.at) + ' ms, ' +
+                           w.requests + ' request(s) (' + w.reason + ')');
+            }
+        }
         if (this._sink) this._sink.push(picture);
         if (this._feedback.acks) {
             this._sendRtcp(CHANNEL_VIDEO, pictureAck({
                 ssrc: this._secrets.videoSsrc,
                 don: picture.don & 0xffff,
             }));
+        }
+    }
+
+    // ----- key pictures -----
+
+    // Ask the Mac for a key picture: a PLI now, then by turns a FIR and a
+    // PLI every KEY_RETRY_MS (_driveKeyWait) until one comes. Not while a
+    // re-offer is out: the stream that answers it starts with one.
+    _startKeyWait(reason) {
+        if (this.state !== 'streaming' || this._reoffering || this._keyWait) return;
+        this.stats.keyWaits++;
+        this._keyWait = { reason, at: this._now(), requests: 0, retries: 0 };
+        this._warn('requesting key picture (' + reason + ')');
+        this._requestKey(false);
+    }
+
+    // One request, alone (not compound), naming the current stream's video
+    // SSRC, on the video channel.
+    _requestKey(useFir) {
+        const ids = { ssrc: this._secrets.videoSsrc, mediaSsrc: this._answer.video.ssrc };
+        let packet;
+        if (useFir) {
+            this._firSeq = (this._firSeq + 1) & 0xff;
+            packet = fir({ ...ids, seq: this._firSeq });
+        } else {
+            packet = pli(ids);
+        }
+        this._keyWait.requests++;
+        this.stats.keyRequests++;
+        this._sendRtcp(CHANNEL_VIDEO, packet);
+    }
+
+    // Every tick: start a wait for a stream that needs a key picture and is
+    // not being asked (the assembler is waiting, or the stream has had none
+    // KEY_FIRST_MS after its first video packet); ask again on KEY_RETRY_MS;
+    // give up after KEY_WAIT_MS with a recovery. An answered wait is no tier
+    // trigger: a tier change restarts the stream and would undo the repair.
+    _driveKeyWait(now) {
+        if (this.state !== 'streaming' || this._reoffering) return;
+        const w = this._keyWait;
+        if (!w) {
+            if (this._assembler && this._assembler.waitingForKey) {
+                this._startKeyWait('waiting for picture ' + this._assembler.diag.next);
+            } else if (this._streamVideoAt !== null && !this._streamKeySeen &&
+                       now - this._streamVideoAt >= KEY_FIRST_MS) {
+                this._startKeyWait('no key picture yet');
+            }
+            return;
+        }
+        const elapsed = now - w.at;
+        if (elapsed >= KEY_WAIT_MS) {
+            this._keyWait = null;
+            this._streamingFail('stalled', 'no key picture');
+            return;
+        }
+        const due = Math.floor(elapsed / KEY_RETRY_MS);
+        if (due > w.retries) {
+            w.retries = due;
+            this._requestKey(due % 2 === 1);
         }
     }
 
@@ -945,11 +1041,13 @@ export class HpSession {
             now - this._lastMediaAt > MEDIA_SILENCE_MS) {
             this._streamingFail('media-stopped');
         }
-        // No finished picture for a while — frozen, even if bytes still flow.
-        if (this.state === 'streaming' && !this._reoffering && this._lastPictureAt !== null &&
-            now - this._lastPictureAt > PICTURE_STALL_MS) {
+        // Video still coming but no finished picture for a while: frozen.
+        if (this.state === 'streaming' && !this._reoffering && !this._keyWait &&
+            this._lastPictureAt !== null && now - this._lastPictureAt > PICTURE_STALL_MS &&
+            this._lastVideoPacketAt !== null && now - this._lastVideoPacketAt < PICTURE_STALL_MS) {
             this._streamingFail('stalled', 'no new picture');
         }
+        this._driveKeyWait(now);
         this._driveTier(now);
         if (!this._feedback.rateControl || this.state === 'failed') return;
         const sinceLast = this._lastVideoPacketAt === null ? 0 : now - this._lastVideoPacketAt;
