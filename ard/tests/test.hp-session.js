@@ -18,7 +18,7 @@ import { splitKeyBlock } from '../hp/negotiation.js';
 import { pictureAck, pli, fir } from '../hp/feedback.js';
 import {
     HpSession, CHANNEL_AUDIO, CHANNEL_VIDEO, hpFailureKeepsSession, TIER_GRACE_MS, TIER_STORED_MAX_AGE_MS,
-    TIER_STORED_MAX_AHEAD_MS, TIER_PERSIST_DOWN_MS, KEY_FIRST_MS, KEY_RETRY_MS, KEY_WAIT_MS,
+    TIER_STORED_MAX_AHEAD_MS, TIER_PERSIST_DOWN_MS, KEY_FIRST_MS, KEY_RETRY_MS, KEY_WAIT_MS, VIDEO_GAP_MS,
 } from '../hp/session.js';
 import { codecFromAnnexB, splitAnnexB, DEFAULT_CODEC } from '../hp/hevc.js';
 import { overlayGeometry } from '../hp/video-sink.js';
@@ -995,6 +995,49 @@ describe('High Performance session', () => {
         ok(!warns.some(w => w.startsWith('glitch')), warns.join('; '));
         strictEqual(session.stats.keyWaits, 0);
         strictEqual(session.state, 'streaming');
+    });
+
+    it('does not call the first picture after a still screen a freeze', async () => {
+        strictEqual(VIDEO_GAP_MS, 1000);
+        const warns = [];
+        const keys = await stream({ warn: m => warns.push(m) });
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        const audio = await createContext(keys.audio.fromServer.key, keys.audio.fromServer.salt);
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(keyPicturePacket({ stripe: 0, seq: 1, don: 1, frame: 1 })));
+        await until(() => session.stats.pictures === 1, 'the first picture');
+        // A still screen: sound only, for 5 s.
+        for (let seq = 0; seq < 5; seq++) {
+            ws.deliver(CHANNEL_AUDIO, await audio.protectRtp(audioPacket(seq)));
+            await until(() => session.stats.audioPackets === seq + 1, 'the audio packet');
+            pass(1000);
+        }
+        // Then the screen changes: the first packet of a large picture, and
+        // 2 s before the rest of it arrives (sound keeps coming).
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(firstOfTwoPacket({ stripe: 0, seq: 2, don: 2, frame: 2 })));
+        await until(() => session.stats.videoPackets === 2, 'the packet');
+        for (let seq = 5; seq < 7; seq++) {
+            ws.deliver(CHANNEL_AUDIO, await audio.protectRtp(audioPacket(seq)));
+            await until(() => session.stats.audioPackets === seq + 1, 'the audio packet');
+            pass(1000);
+        }
+        await settle();
+        ok(!warns.some(w => w.startsWith('glitch')), warns.join('; '));
+        strictEqual(offers.length, 1, 'no re-offer');
+        strictEqual(session.state, 'streaming');
+    });
+
+    it('does not time the first key picture from a packet of another stream', async () => {
+        const keys = await stream();
+        const videoIn = await createContext(keys.video.fromServer.key, keys.video.fromServer.salt);
+        // A non-key picture on an SSRC past the answer's four stripes.
+        const packet = keyPicturePacket({ stripe: 2, seq: 1, don: 5, frame: 1 });
+        packet.set(u32(SERVER_VIDEO_SSRC + 4), 8);
+        ws.deliver(CHANNEL_VIDEO, await videoIn.protectRtp(packet));
+        await until(() => session.stats.videoPackets === 1, 'the packet');
+        pass(1500);
+        await settle();
+        strictEqual(keyRequests().length, 0);
+        strictEqual(session.stats.keyWaits, 0);
     });
 
     it('still catches bytes that never complete a picture, then falls back if recovery brings nothing', async () => {

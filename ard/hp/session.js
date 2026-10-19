@@ -93,6 +93,9 @@ const MEDIA_SILENCE_MS = 3000;
 // is the MEDIA_SILENCE_MS watchdog's. A lost picture is the key wait's,
 // with its own limit (KEY_WAIT_MS).
 const PICTURE_STALL_MS = 3000;
+// Video after a break this long is a new flow (a still screen that changed):
+// the freeze watchdog counts from its start, not from the last picture.
+export const VIDEO_GAP_MS = 1000;
 
 // The Mac sends a key picture only when a stream starts, so a lost picture
 // leaves nothing to decode from until it is asked for one. A stream with no
@@ -219,6 +222,7 @@ export class HpSession {
         this._sendChain = [Promise.resolve(), Promise.resolve()];
         this._recvStats = new ReceiveStats();
         this._lastVideoPacketAt = null;
+        this._videoFlowSince = null;             // video packets without a VIDEO_GAP_MS break since
         this._lastPictureAt = null;              // when a picture last completed
         this._lastMediaAt = null;                // last packet of either stream that verified
         this._lastSenderReport = [null, null];   // per channel: { middle, at }
@@ -324,6 +328,7 @@ export class HpSession {
         }
         this._torn = true;
         this._reoffering = false;
+        this._keyWait = null;
         this._pendingSecrets = null;
         this._resizeDone();
         if (this._ws) {
@@ -746,6 +751,7 @@ export class HpSession {
         // window so the gap of the mode switch does not trip them.
         this._lastMediaAt = this._now();
         this._lastVideoPacketAt = this._now();
+        this._videoFlowSince = this._now();
         this._lastPictureAt = this._now();
         this._streamStartAt = this._now();
         // Its first-key timer starts from its own first video packet.
@@ -890,8 +896,16 @@ export class HpSession {
             }
             this.stats.videoPackets++;
             this.stats.videoBytes += rtp.payload.length;
-            this._lastVideoPacketAt = this._now();
-            if (this._streamVideoAt === null) this._streamVideoAt = now;
+            const at = this._now();
+            if (this._lastVideoPacketAt === null || at - this._lastVideoPacketAt >= VIDEO_GAP_MS) {
+                this._videoFlowSince = at;
+            }
+            this._lastVideoPacketAt = at;
+            // Only the current stream's own stripes start its first-key timer.
+            const video = this._answer.video;
+            if (this._streamVideoAt === null && ((rtp.ssrc - video.ssrc) >>> 0) < video.stripes) {
+                this._streamVideoAt = now;
+            }
             this._recvStats.onPacket({
                 ssrc: rtp.ssrc, seq: rtp.seq, rtpTs: rtp.timestamp, clockRate: VIDEO_CLOCK,
                 bytes: rtp.payload.length, now, video: true,
@@ -1050,8 +1064,11 @@ export class HpSession {
             this._streamingFail('media-stopped');
         }
         // Video still coming but no finished picture for a while: frozen.
+        // Counted from the later of the last picture and the start of the
+        // current flow, so a still screen that changes is not one.
         if (this.state === 'streaming' && !this._reoffering && !this._keyWait &&
-            this._lastPictureAt !== null && now - this._lastPictureAt > PICTURE_STALL_MS &&
+            this._lastPictureAt !== null && this._videoFlowSince !== null &&
+            now - Math.max(this._lastPictureAt, this._videoFlowSince) > PICTURE_STALL_MS &&
             this._lastVideoPacketAt !== null && now - this._lastVideoPacketAt < PICTURE_STALL_MS) {
             this._streamingFail('stalled', 'no new picture');
         }
