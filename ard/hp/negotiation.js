@@ -309,6 +309,8 @@ const AGENT_CONTROL_VERSION = 1;
 const AGENT_CONTROL_LENGTH = 16;
 
 export function parseAgentControl(frame) {
+    // Exactly 16 bytes, deliberately: version 1 has no extension room, and a
+    // later version that adds fields will say so in its version byte.
     if (!frame || frame.length !== AGENT_CONTROL_LENGTH) return null;
     if (frame[0] !== AGENT_CONTROL_CHANNEL || frame[1] !== AGENT_CONTROL_VERSION) return null;
     const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);

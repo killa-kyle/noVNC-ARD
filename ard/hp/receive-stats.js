@@ -10,7 +10,11 @@
  * Observation is kept apart from inference: loss is counted from sequence
  * numbers, jitter follows the RFC, and queuing delay is the growth of
  * (arrival time - RTP time) over its own 10 s minimum. That last is a
- * signal that a queue is filling, not a measurement of any one hop.
+ * signal that a queue is filling, not a measurement of any one hop. It is
+ * taken once per picture, from the first packet of each new RTP timestamp:
+ * the rest of a large picture follow at the sender's pace, and their spread
+ * is serialization, not queuing. The caller passes the arrival time, taken
+ * before any local work (decryption) on the packet.
  */
 
 import { extendSeq } from './seq.js';
@@ -60,6 +64,7 @@ class Stream {
         this.jitter = 0;
         this.prevTs = rtpTs;
         this.extTs = rtpTs;
+        this.maxExtTs = null;       // newest picture (RTP time) seen
         this.firstTs = rtpTs;
         this.firstAt = now;
         this.prevArrival = null;
@@ -69,8 +74,8 @@ class Stream {
     }
 
     // Returns how many packets the stream has moved on by (0 for a late one,
-    // 1 for the first)
-    // and the queuing delay of this packet above its baseline.
+    // 1 for the first) and, for the first packet of a newer picture, its
+    // queuing delay above the baseline (null for any other packet).
     add(seq, rtpTs, now) {
         const ext = extendSeq(this.maxSeq, seq);
         const first = this.received === 0;
@@ -90,6 +95,8 @@ class Stream {
         }
         this.prevTransit = transit;
 
+        if (this.maxExtTs !== null && this.extTs <= this.maxExtTs) return { advance, excess: null };
+        this.maxExtTs = this.extTs;
         const rel = (now - this.firstAt) - (this.extTs - this.firstTs) * 1000 / this.clockRate;
         const q = this.baseline;
         while (q.length > 0 && q.peek().at < now - BASELINE_MS) q.shift();
@@ -168,7 +175,7 @@ export class ReceiveStats {
             expected += s.expected;
             received++;
             bytes += s.bytes;
-            if (s.excess > queueDelayMs) queueDelayMs = s.excess;
+            if (s.excess !== null && s.excess > queueDelayMs) queueDelayMs = s.excess;
         }
         const span = this._videoSince === null ? 0
             : Math.min(WINDOW_MS, Math.max(MIN_RATE_SPAN_MS, now - this._videoSince));

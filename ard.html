@@ -466,10 +466,9 @@
             rfb._ardHpDisplay = (hp && ardResizeToWindow) ? ardWindowDisplay() : ardHpDisplay();
             rfb._ardHpAudio = ardHpAudio;
             rfb._ardHpShowLocalCursor = ardHpShowLocalCursor();
-            // The tier this browser last held for this Mac is kept by its
-            // name (the RFB layer falls back to the name the Mac gives);
-            // an operator may cap it.
-            rfb._ardHpTierKey = UI.desktopName || null;
+            // The tier this browser last held for this Mac is kept by the
+            // name the Mac gives (the RFB layer's fallback when no embedder
+            // names it); an operator may cap it.
             rfb._ardHpMaxKbit = ardHpMaxKbit();
             rfb.ardAudioMuted = ardAudioMuted;
             // Virtual Display in Standard quality is the ordinary virtual

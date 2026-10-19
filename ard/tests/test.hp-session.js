@@ -16,7 +16,9 @@ import { deflate, inflate } from '../hp/zlib.js';
 import { createContext } from '../hp/srtp.js';
 import { splitKeyBlock } from '../hp/negotiation.js';
 import { pictureAck } from '../hp/feedback.js';
-import { HpSession, CHANNEL_AUDIO, CHANNEL_VIDEO, hpFailureKeepsSession } from '../hp/session.js';
+import {
+    HpSession, CHANNEL_AUDIO, CHANNEL_VIDEO, hpFailureKeepsSession, TIER_GRACE_MS, TIER_STORED_MAX_AGE_MS,
+} from '../hp/session.js';
 import { codecFromAnnexB, splitAnnexB, DEFAULT_CODEC } from '../hp/hevc.js';
 import { overlayGeometry } from '../hp/video-sink.js';
 
@@ -171,14 +173,14 @@ function controlFrame({ budgetKbit = 0, version = 1 } = {}) {
 
 // A one-packet key picture for a stripe: parameter sets and an IDR slice
 // aggregated, as the server starts each stream.
-function keyPicturePacket({ stripe, seq, don, frame }) {
+function keyPicturePacket({ stripe, seq, don, frame, ts }) {
     const nals = [
         [0x40, 0x01, 0xaa], [0x42, 0x01, 0xbb], [0x44, 0x01, 0xcc],
         [stripe === 0 ? 0x28 : 0x02, 0x01, 0xd0 + stripe, 1, 2, 3],
     ];
     const payload = [0x60, 0x01, ...u16(don), ...nals.flatMap(n => [...u16(n.length), ...n])];
     return new Uint8Array([
-        0x90, 0x80 | 100, ...u16(seq), ...u32(frame * 400), ...u32(SERVER_VIDEO_SSRC + stripe),
+        0x90, 0x80 | 100, ...u16(seq), ...u32(ts !== undefined ? ts : frame * 400), ...u32(SERVER_VIDEO_SSRC + stripe),
         0x93, 0x11, 0x00, 0x01, ...u16(1), ...u16(frame),
         ...payload,
     ]);
@@ -1096,23 +1098,52 @@ describe('High Performance session', () => {
 
     // ----- the bitrate tier -----
 
-    // Key pictures from the server whose sequence numbers skip `gap` packets
-    // before each: loss as receive stats count it, while every picture
-    // still completes.
-    async function lossyFeed(videoKeys, gap = 4) {
+    // Key pictures from the server, timestamped at the pace they are sent.
+    // feed(count, gap) sends `count`, each `gap` sequence numbers past the
+    // last: loss as receive stats count it, while every picture completes.
+    // With `spreadMs` the packets share one RTP time and come that far
+    // apart, as the packets of one large picture do.
+    async function videoFeed(videoKeys) {
         const server = await createContext(videoKeys.fromServer.key, videoKeys.fromServer.salt);
-        let seq = 100, don = 1, frame = 1;
-        return async (count) => {
+        const t0 = Date.now();
+        let seq = 100, don = 1, first = true;
+        return async (count, gap = 0, spreadMs = null) => {
             const before = session.stats.videoPackets;
+            const pictureTs = Math.round((Date.now() - t0) * 90) >>> 0;
             for (let i = 0; i < count; i++) {
+                if (!first) seq += gap + 1;
+                first = false;
+                const ts = spreadMs === null ? Math.round((Date.now() - t0) * 90) >>> 0 : pictureTs;
                 ws.deliver(CHANNEL_VIDEO, await server.protectRtp(
-                    keyPicturePacket({ stripe: 0, seq, don, frame })));
-                seq += gap + 1;
+                    keyPicturePacket({ stripe: 0, seq: seq & 0xffff, don, frame: don, ts })));
                 don++;
-                frame++;
+                if (spreadMs !== null) {
+                    await until(() => session.stats.videoPackets === before + i + 1, 'the packet');
+                    mock.timers.tick(spreadMs);
+                }
             }
             await until(() => session.stats.videoPackets === before + count, count + ' video packets');
         };
+    }
+
+    // A clean picture a second until the start grace is over.
+    async function pastGrace(feed) {
+        for (let t = 0; t < TIER_GRACE_MS; t += 1000) {
+            await feed(1);
+            pass(1000);
+            await settle();
+        }
+    }
+
+    // Streaming, past the grace, then a lossy moment: the down it causes.
+    async function lossDown(extra) {
+        const keys = await stream(extra);
+        const feed = await videoFeed(keys.video);
+        await pastGrace(feed);
+        await feed(3, 4);
+        pass(50);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        return feed;
     }
 
     const SAME_STREAM = { audioSsrc: SERVER_AUDIO_SSRC, videoSsrc: SERVER_VIDEO_SSRC,
@@ -1128,57 +1159,132 @@ describe('High Performance session', () => {
     }
 
     it('steps the tier down on loss with exactly one re-offer at the lower table', async () => {
-        const keys = await stream();
-        strictEqual(session.tier, 16000);
-        const feed = await lossyFeed(keys.video);
-        await feed(3);
-        pass(1000);
-        await until(() => offers.length === 2, 'the tier re-offer');
+        const feed = await lossDown();
         strictEqual(session.tier, 12000);
         strictEqual(await tierOfOffer(offers[1]), 12000);
         // The loss goes on while the re-offer is out: no second one.
-        await feed(3);
+        await feed(3, 4);
         pass(3000);
         await settle();
         strictEqual(offers.length, 2);
         strictEqual(session.state, 'streaming');
     });
 
-    it('fails once, as media-stopped, when a tier re-offer gets no answer', async () => {
-        const keys = await stream();
-        const feed = await lossyFeed(keys.video);
-        await feed(3);
-        pass(50);
-        await until(() => offers.length === 2, 'the tier re-offer');
-        pass(5000);
-        await settle();
-        strictEqual(session.state, 'failed');
-        strictEqual(session.failure.startsWith('media-stopped'), true);
-        deepStrictEqual(states.filter(s => s.startsWith('failed')), ['failed:media-stopped']);
-        pass(5000);
-        await settle();
+    it('keeps the old stream, and the new tier, when a tier re-offer gets no answer', async () => {
+        const warns = [];
+        const feed = await lossDown({ warn: m => warns.push(m) });
+        // The old stream keeps coming while the answer does not.
+        for (let i = 0; i < 5; i++) {
+            await feed(1);
+            pass(1000);
+            await settle();
+        }
+        ok(warns.some(w => w.startsWith('tier: no answer')), warns.join('; '));
+        strictEqual(session.state, 'streaming');
+        strictEqual(session.reoffering(), false);
+        ok(!states.some(s => s.startsWith('failed')));
+        strictEqual(session.tier, 12000);
+        // Clean from here: no further down, nor any other re-offer.
+        for (let i = 0; i < 4; i++) {
+            await feed(1);
+            pass(1000);
+            await settle();
+        }
         strictEqual(offers.length, 2);
+        strictEqual(session.state, 'streaming');
+    });
+
+    it('leaves a stream that stopped after an unanswered tier re-offer to a real recovery', async () => {
+        await lossDown();
+        pass(5100);                          // no answer, and nothing more arrives
+        await until(() => offers.length === 3, 'the recovery re-offer');
+        strictEqual(session.state, 'streaming');
+        strictEqual(await tierOfOffer(offers[2]), 8000);
     });
 
     it('keeps to one down in 4 s while the loss goes on', async () => {
-        const keys = await stream();
-        const feed = await lossyFeed(keys.video);
-        await feed(3);
-        pass(50);
-        await until(() => offers.length === 2, 'the tier re-offer');
+        await lossDown();
         await answerReoffer();
-        // The new stream is lossy too, sampled every second.
-        const feed2 = await lossyFeed(keysFromOffer(offers[1]).video);
+        // The new stream is lossy too, sampled every second; the last of
+        // these samples is past the grace but inside 4 s of the down.
+        const feed2 = await videoFeed(keysFromOffer(offers[1]).video);
         for (let i = 0; i < 3; i++) {
-            await feed2(3);
+            await feed2(3, 4);
             pass(1000);
             await settle();
         }
         strictEqual(offers.length, 2, 'no down inside 4 s of the last');
-        await feed2(3);
+        await feed2(3, 4);
         pass(1000);
         await until(() => offers.length === 3, 'the next down');
         strictEqual(await tierOfOffer(offers[2]), 8000);
+    });
+
+    it('sees no loss or delay in the start grace, on connect and after a swap', async () => {
+        const keys = await stream();
+        const feed = await videoFeed(keys.video);
+        // The start burst: lossy for the whole grace.
+        for (let t = 0; t < TIER_GRACE_MS; t += 1000) {
+            await feed(3, 4);
+            pass(1000);
+            await settle();
+        }
+        strictEqual(offers.length, 1);
+        // A requested tier change; the new stream's start is lossy too.
+        strictEqual(session.setTier(12000), true);
+        await until(() => offers.length === 2, 'the tier re-offer');
+        await answerReoffer();
+        const feed2 = await videoFeed(keysFromOffer(offers[1]).video);
+        for (let t = 0; t < TIER_GRACE_MS; t += 1000) {
+            await feed2(3, 4);
+            pass(1000);
+            await settle();
+        }
+        strictEqual(offers.length, 2);
+        // Past the grace the same loss counts.
+        await feed2(3, 4);
+        pass(1000);
+        await until(() => offers.length === 3, 'the down');
+        strictEqual(await tierOfOffer(offers[2]), 8000);
+    });
+
+    it('times packets by their arrival, not by when decryption finished', async () => {
+        const keys = await stream();
+        const feed = await videoFeed(keys.video);
+        await pastGrace(feed);
+        // The next picture arrives on time, but its decryption is held up
+        // for 500 ms (a busy machine).
+        const ctx = session._ctx.videoIn;
+        const unprotect = ctx.unprotectRtp.bind(ctx);
+        let started = false, release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        ctx.unprotectRtp = async (packet) => {
+            started = true;
+            const rtp = await unprotect(packet);
+            await gate;
+            return rtp;
+        };
+        const done = feed(1);
+        await until(() => started, 'the decryption to start');
+        mock.timers.tick(500);
+        release();
+        await done;
+        ctx.unprotectRtp = unprotect;
+        pass(1000);
+        await settle();
+        strictEqual(offers.length, 1, 'no down for a delay of our own making');
+        strictEqual(session.tier, 16000);
+    });
+
+    it('does not take one large picture spread over 300 ms for a queue', async () => {
+        const keys = await stream();
+        const feed = await videoFeed(keys.video);
+        await pastGrace(feed);
+        await feed(12, 0, 25);               // twelve packets of one RTP time, 25 ms apart
+        pass(1000);
+        await settle();
+        strictEqual(offers.length, 1);
+        strictEqual(session.tier, 16000);
     });
 
     it('a resize re-offer carries the tier in force', async () => {
@@ -1188,11 +1294,7 @@ describe('High Performance session', () => {
         strictEqual(await tierOfOffer(offers[1]), 8000);
         session.close();
 
-        const keys = await stream();
-        const feed = await lossyFeed(keys.video);
-        await feed(3);
-        pass(50);
-        await until(() => offers.length === 2, 'the tier re-offer');
+        await lossDown();
         await answerReoffer();
         session.reoffer();
         await until(() => offers.length === 3, 'the resize offer');
@@ -1208,11 +1310,7 @@ describe('High Performance session', () => {
     });
 
     it('does not count tier re-offers against the recovery limit', async () => {
-        const keys = await stream();
-        const feed = await lossyFeed(keys.video);
-        await feed(3);
-        pass(50);
-        await until(() => offers.length === 2, 'the tier re-offer');
+        await lossDown();
         await answerReoffer();
         for (let i = 0; i < 3; i++) {
             const before = offers.length;
@@ -1236,43 +1334,46 @@ describe('High Performance session', () => {
         strictEqual(new DataView(plain.buffer, plain.byteOffset).getUint16(30), 10000);
     });
 
-    it('starts at the tier stored for this Mac, capped by maxKbit', async () => {
-        const storage = fakeStorage({ 'ardHpTier:mac1': '10000', 'ardHpTier:mac3': '9999' });
-        await negotiate({ tierKey: 'mac1', storage });
-        strictEqual(await tierOfOffer(offers[0]), 10000);
-        session.close();
-        await negotiate({ tierKey: 'mac1', storage, maxKbit: 6000 });
-        strictEqual(await tierOfOffer(offers[0]), 6000);
-        session.close();
-        await negotiate({ tierKey: 'mac2', storage });
-        strictEqual(await tierOfOffer(offers[0]), 16000, 'nothing stored');
-        session.close();
-        await negotiate({ tierKey: 'mac3', storage });
-        strictEqual(await tierOfOffer(offers[0]), 16000, 'not a tier');
-        session.close();
+    it('starts at the tier stored for this Mac in the last day, capped by maxKbit', async () => {
+        const stored = (tier, ageMs = 0) => JSON.stringify({ tier, at: Date.now() - ageMs });
+        const storage = fakeStorage({
+            'ardHpTier:mac1': stored(10000),
+            'ardHpTier:mac3': stored(9999),
+            'ardHpTier:old': stored(10000, TIER_STORED_MAX_AGE_MS + 1),
+            'ardHpTier:legacy': '8000',
+            'ardHpTier:junk': '{',
+        });
+        const startTier = async (extra) => {
+            await negotiate(Object.assign({ storage }, extra));
+            const tier = await tierOfOffer(offers[0]);
+            session.close();
+            return tier;
+        };
+        strictEqual(await startTier({ tierKey: 'mac1' }), 10000);
+        strictEqual(await startTier({ tierKey: 'mac1', maxKbit: 6000 }), 6000);
+        strictEqual(await startTier({ tierKey: 'mac2' }), 16000, 'nothing stored');
+        strictEqual(await startTier({ tierKey: 'mac3' }), 16000, 'not a tier');
+        strictEqual(await startTier({ tierKey: 'old' }), 16000, 'older than a day');
+        strictEqual(await startTier({ tierKey: 'legacy' }), 8000, 'a bare number from an earlier build');
+        strictEqual(await startTier({ tierKey: 'junk' }), 16000, 'not JSON');
         // An explicit start tier comes before the stored one.
-        await negotiate({ tierKey: 'mac1', storage, tier: 8000 });
-        strictEqual(await tierOfOffer(offers[0]), 8000);
-        session.close();
+        strictEqual(await startTier({ tierKey: 'mac1', tier: 8000 }), 8000);
         // Storage that refuses is no failure.
         const refusing = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } };
-        await negotiate({ tierKey: 'mac1', storage: refusing });
-        strictEqual(await tierOfOffer(offers[0]), 16000);
+        strictEqual(await startTier({ tierKey: 'mac1', storage: refusing }), 16000);
     });
 
-    it('stores the tier and reports it on every change', async () => {
+    it('stores the tier with its time and reports it on every change', async () => {
         const storage = fakeStorage();
         const seen = [];
-        const keys = await stream({ tierKey: 'mac1', storage, onTier: t => seen.push(t) });
-        const feed = await lossyFeed(keys.video);
-        await feed(3);
-        pass(50);
-        await until(() => offers.length === 2, 'the tier re-offer');
-        strictEqual(storage.getItem('ardHpTier:mac1'), '12000');
+        const warns = [];
+        await lossDown({ tierKey: 'mac1', storage, onTier: t => seen.push(t), warn: m => warns.push(m) });
+        deepStrictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')), { tier: 12000, at: Date.now() });
         deepStrictEqual(seen, [12000]);
+        ok(warns.some(w => w.startsWith('tier 16000 -> 12000 kbit/s (down: ')), warns.join('; '));
         await answerReoffer();
         strictEqual(session.setTier(6000), true);
-        strictEqual(storage.getItem('ardHpTier:mac1'), '6000');
+        strictEqual(JSON.parse(storage.getItem('ardHpTier:mac1')).tier, 6000);
         deepStrictEqual(seen, [12000, 6000]);
     });
 
@@ -1313,6 +1414,8 @@ describe('High Performance session', () => {
             await settle();
         }
         deepStrictEqual(counts(), before);
+        strictEqual(session.stats.controlFrames, 9);
+        strictEqual(session.stats.controlRejected, 6);
         // They kept nothing alive: the silence is noticed as such.
         pass(100);
         await settle();
@@ -1333,15 +1436,21 @@ describe('High Performance session', () => {
         strictEqual(await tierOfOffer(offers[1]), 6000);
     });
 
-    it('ignores an agent budget older than 3 s', async () => {
-        await negotiate();
-        ws.deliver(2, controlFrame({ budgetKbit: 9000 }));
-        pass(3100);
-        sinks[0].opts.onFirstFrame();
-        pass(1000);
-        await settle();
-        strictEqual(offers.length, 1);
-        strictEqual(session.tier, 16000);
+    it('takes an agent budget up to 3 s old and no older', async () => {
+        // The first sample comes on the first tick after streaming begins.
+        const sampledAt = async (ageMs) => {
+            await negotiate();
+            ws.deliver(2, controlFrame({ budgetKbit: 9000 }));
+            pass(ageMs - 50);
+            sinks[0].opts.onFirstFrame();
+            mock.timers.tick(50);
+            await settle();
+            const tier = session.tier;
+            session.close();
+            return tier;
+        };
+        strictEqual(await sampledAt(2900), 6000);
+        strictEqual(await sampledAt(3100), 16000);
     });
 
     it('closes quietly', async () => {

@@ -54,6 +54,12 @@ const REPORT_MS = 1000;
 const RATE_CONTROL_MS = 50;
 // How often the tier controller is sampled.
 export const TIER_EVAL_MS = 1000;
+// A stream starts with a burst (key pictures, the backlog of the switch), so
+// for this long after each start its loss and delay are no evidence about
+// the path and the controller does not see them.
+export const TIER_GRACE_MS = 3000;
+// A stored tier older than this is not this path's any more.
+export const TIER_STORED_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // The agent's budget counts only from a control frame this recent.
 const AGENT_CONTROL_MAX_AGE_MS = 3000;
 // Where the tier this browser last held for a Mac is kept, by tierKey.
@@ -163,13 +169,14 @@ export class HpSession {
         this.tier = this._tierCtl.tier;
         this._tierWhy = null;               // what moved the controller last
         this._lastTierEvalAt = null;
+        this._streamStartAt = null;         // when the current stream began, for TIER_GRACE_MS
         this._agentControl = null;          // last control frame, with its arrival time
 
         this.state = 'idle';
         this.failure = null;
         this.stats = {
             videoPackets: 0, videoBytes: 0, audioPackets: 0, audioBytes: 0, rtcpPackets: 0,
-            authFailures: 0, pictures: 0, keyPictures: 0, sent: 0, controlFrames: 0,
+            authFailures: 0, pictures: 0, keyPictures: 0, sent: 0, controlFrames: 0, controlRejected: 0,
         };
 
         this._ws = null;
@@ -396,13 +403,13 @@ export class HpSession {
             return;
         }
         // A re-offer sent during a session: swap the stream in without
-        // disturbing the picture on screen. A resize's failure is not the
-        // session's; the old stream stays. A recovery or a tier change has
+        // disturbing the picture on screen. A resize's or a tier change's
+        // failure is not the session's; the old stream stays. A recovery has
         // no stream to fall back on.
         if (this._reoffering && this.state === 'streaming') {
             this._swapMedia(payload).catch((e) => {
                 const fatal = this._reofferFatal();
-                this._log('re-offer answer failed: ' + (e && e.message ? e.message : e));
+                this._reofferLost(this._reofferKind + ' re-offer answer failed: ' + (e && e.message ? e.message : e));
                 this._endReoffer();
                 this._resizeDone();
                 if (fatal) this._fail('bad-answer', e && e.message ? e.message : String(e));
@@ -456,7 +463,7 @@ export class HpSession {
                 if (this._reofferGen !== gen || !this._reoffering) return;
                 const kind = this._reofferKind;
                 const fatal = this._reofferFatal();
-                this._log(kind + ': no answer');
+                this._reofferLost(kind + ': no answer');
                 this._endReoffer();
                 this._resizeDone();
                 if (fatal) this._fail('media-stopped', kind + ' got no answer');
@@ -464,41 +471,57 @@ export class HpSession {
         }, (e) => {
             if (this._reofferGen !== gen) return;
             const fatal = this._reofferFatal();
-            this._log('re-offer failed: ' + e.message);
+            this._reofferLost(this._reofferKind + ' re-offer failed: ' + e.message);
             this._endReoffer();
             this._resizeDone();
             if (fatal) this._fail('offer', e.message);
         });
     }
 
-    // A resize leaves the old stream running when it fails. A recovery or a
-    // tier change has asked the server to restart its media, so it does not.
+    // A resize or a tier change that fails leaves the old stream running (the
+    // tier stays as chosen; the next re-offer carries it). If the old stream
+    // has stopped after all, the silence and freeze watchdogs start a real
+    // recovery. A recovery that fails has nothing left to fall back on.
     _reofferFatal() {
-        return this._reofferKind !== 'resize';
+        return this._reofferKind === 'recovery';
+    }
+
+    // How a re-offer that came to nothing is logged.
+    _reofferLost(what) {
+        if (this._reofferKind === 'resize') this._log(what);
+        else this._warn(what + (this._reofferFatal() ? '' : '; keeping the old stream'));
     }
 
     // ----- the bit-rate tier -----
 
-    // The tier this browser last held for this Mac, or null.
+    // The tier this browser last held for this Mac within the last day, or
+    // null. Stored as {"tier", "at" (Unix ms)}; a bare number (an earlier
+    // build) is taken without an age.
     _storedTier() {
         if (!this._tierKey || !this._storage) return null;
+        let value;
         try {
             const raw = this._storage.getItem(TIER_STORAGE_PREFIX + this._tierKey);
-            const tier = raw === null ? NaN : Number(raw);
-            return TIERS.includes(tier) ? tier : null;
+            if (raw === null) return null;
+            value = JSON.parse(raw);
         } catch (e) {
-            return null;
+            return null;    // storage blocked, or not JSON
         }
+        if (typeof value === 'number') return TIERS.includes(value) ? value : null;
+        if (!value || typeof value !== 'object' || !TIERS.includes(value.tier)) return null;
+        if (!Number.isFinite(value.at) || Date.now() - value.at > TIER_STORED_MAX_AGE_MS) return null;
+        return value.tier;
     }
 
     // The tier the session now offers: logged, stored, reported.
     _adoptTier(tier, reason) {
         if (tier === this.tier) return;
-        this._log('tier ' + this.tier + ' -> ' + tier + ' kbit/s (' + reason + ')');
+        this._warn('tier ' + this.tier + ' -> ' + tier + ' kbit/s (' + reason + ')');
         this.tier = tier;
         if (this._tierKey && this._storage) {
             try {
-                this._storage.setItem(TIER_STORAGE_PREFIX + this._tierKey, String(tier));
+                this._storage.setItem(TIER_STORAGE_PREFIX + this._tierKey,
+                                      JSON.stringify({ tier, at: Date.now() }));
             } catch (e) { /* storage blocked: the tier still applies */ }
         }
         this._onTier(tier);
@@ -514,17 +537,24 @@ export class HpSession {
 
     // One controller sample; `recovery` names the glitch being recovered
     // from, if any. Remembers what moved it, for the log.
+    // Inside TIER_GRACE_MS of a stream start, loss and delay go in as
+    // unknown (NaN): no down from them, and no credit toward an up.
     _sampleTier(now, recovery) {
         this._lastTierEvalAt = now;
         const w = this._recvStats.window(now);
+        const grace = this._streamStartAt !== null && now - this._streamStartAt < TIER_GRACE_MS;
+        if (grace) {
+            w.lossPct = NaN;
+            w.queueDelayMs = NaN;
+        }
         const budget = this._agentBudget(now);
         const from = this._tierCtl.tier;
         const next = this._tierCtl.sample({ now, ...w, budget, recovery: !!recovery });
         if (next === null) return;
         this._tierWhy = (next < from ? 'down' : 'up') + ': ' +
             (recovery ? 'recovery from ' + recovery + ', ' : '') +
-            'loss ' + w.lossPct.toFixed(1) + '%, delay ' + Math.round(w.queueDelayMs) + ' ms, video ' +
-            Math.round(w.videoKbit) + ' kbit/s, ' +
+            (grace ? 'stream starting' : 'loss ' + w.lossPct.toFixed(1) + '%, delay ' +
+                Math.round(w.queueDelayMs) + ' ms') + ', video ' + Math.round(w.videoKbit) + ' kbit/s, ' +
             (!budget ? 'no budget' : budget.limiting ? 'budget ' + budget.kbit + ' kbit/s' : 'budget not limiting');
     }
 
@@ -661,6 +691,7 @@ export class HpSession {
         this._lastMediaAt = this._now();
         this._lastVideoPacketAt = this._now();
         this._lastPictureAt = this._now();
+        this._streamStartAt = this._now();
         // The audio stream restarts with a new SSRC and sequence; let its
         // reorder take the new numbers, or every packet reads as late.
         if (this._audio && this._audio.resetStream) this._audio.resetStream();
@@ -698,6 +729,7 @@ export class HpSession {
             onFirstFrame: () => {
                 if (this.state === 'waiting') {
                     this._lastPictureAt = this._now();
+                    this._streamStartAt = this._lastPictureAt;
                     this._setState('streaming');
                 }
             },
@@ -723,7 +755,7 @@ export class HpSession {
         // Datagrams that arrived while the keys were being derived.
         const early = this._early || [];
         this._early = null;
-        for (const data of early) this._onMedia(data);
+        for (const { data, at } of early) this._onMedia(data, at);
 
         this._timeout(FIRST_FRAME_MS, () => {
             if (this.state === 'waiting') this._fail('no-picture');
@@ -734,7 +766,10 @@ export class HpSession {
 
     // ----- media in -----
 
-    _onMedia(data) {
+    // `arrivedAt`: when the datagram came in, before any work on it here;
+    // the receive stats time packets by it, so a decryption backlog is not
+    // mistaken for a queue on the path.
+    _onMedia(data, arrivedAt = this._now()) {
         if (!this._loggedRecv) { this._loggedRecv = true; this._log('HP first media RECV bytes=' + (data.byteLength || data.length)); }
         if (this.state === 'failed' || this.state === 'closed') return;
         const bytes = new Uint8Array(data);
@@ -747,7 +782,7 @@ export class HpSession {
         if (!this._ctx) {
             // The server may start before our keys are ready.
             if (this.state === 'offering') {
-                (this._early = this._early || []).push(data);
+                (this._early = this._early || []).push({ data, at: arrivedAt });
                 if (this._early.length > 4096) this._early.shift();
             }
             return;
@@ -756,7 +791,7 @@ export class HpSession {
         const channel = bytes[0];
         const packet = bytes.subarray(1);
         if (channel !== CHANNEL_AUDIO && channel !== CHANNEL_VIDEO) return;
-        const now = this._now();
+        const now = arrivedAt;
         const ctx = channel === CHANNEL_VIDEO ? this._ctx.videoIn : this._ctx.audioIn;
 
         if (isRtcp(packet)) {
@@ -783,7 +818,7 @@ export class HpSession {
                 this.stats.audioBytes += rtp.payload.length;
                 this._recvStats.onPacket({
                     ssrc: rtp.ssrc, seq: rtp.seq, rtpTs: rtp.timestamp, clockRate: AUDIO_CLOCK,
-                    bytes: rtp.payload.length, now: this._lastMediaAt, video: false,
+                    bytes: rtp.payload.length, now, video: false,
                 });
                 if (this._audio) this._audio.push(rtp);
                 return;
@@ -799,7 +834,7 @@ export class HpSession {
             this._lastVideoPacketAt = this._now();
             this._recvStats.onPacket({
                 ssrc: rtp.ssrc, seq: rtp.seq, rtpTs: rtp.timestamp, clockRate: VIDEO_CLOCK,
-                bytes: rtp.payload.length, now: this._lastVideoPacketAt, video: true,
+                bytes: rtp.payload.length, now, video: true,
             });
             this._assembler.push(rtp, this._now());
         }, () => {
@@ -809,9 +844,12 @@ export class HpSession {
     }
 
     _onAgentControl(bytes) {
-        const frame = parseAgentControl(bytes);
-        if (!frame) return;
         this.stats.controlFrames++;
+        const frame = parseAgentControl(bytes);
+        if (!frame) {
+            this.stats.controlRejected++;
+            return;
+        }
         if (!this._agentControl) {
             this._log('agent control: budget ' + frame.budgetKbit + ' kbit/s, queue ' + frame.queueMs +
                       ' ms, rtt ' + frame.rttMs + ' ms, loss ' + frame.lossPermille + '‰');

@@ -123,6 +123,32 @@ describe('ReceiveStats window', () => {
         strictEqual(stats.window(20000).queueDelayMs, 0);
     });
 
+    it('takes delay once per picture: a large frame spread over 300 ms is not queuing', () => {
+        const stats = new ReceiveStats();
+        // 60 pictures/s, one packet each, steady 30 ms transit.
+        let seq = 0;
+        for (let i = 0; i < 600; i++) {
+            stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: i * 1500, clockRate: VIDEO, bytes: 1000,
+                             now: i * 1000 / 60 + 30, video: true });
+        }
+        // A key picture of 300 packets, all one RTP time, arriving over 300 ms.
+        const ts = 600 * 1500;
+        const start = 600 * 1000 / 60 + 30;
+        for (let k = 0; k < 300; k++) {
+            stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: ts, clockRate: VIDEO, bytes: 1000,
+                             now: start + k, video: true });
+        }
+        ok(stats.window(start + 300).queueDelayMs < 1, 'got ' + stats.window(start + 300).queueDelayMs);
+        // A late packet of an older picture is no delay sample either.
+        stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: ts - 1500, clockRate: VIDEO, bytes: 1000,
+                         now: start + 400, video: true });
+        ok(stats.window(start + 400).queueDelayMs < 1);
+        // The next picture arriving late is.
+        stats.onPacket({ ssrc: SSRC, seq: seq++, rtpTs: ts + 1500, clockRate: VIDEO, bytes: 1000,
+                         now: start + 1000 / 60 + 200, video: true });
+        ok(Math.abs(stats.window(start + 300).queueDelayMs - 200) < 1);
+    });
+
     it('is not fooled by the 32-bit timestamp wrapping', () => {
         const stats = new ReceiveStats();
         for (let i = 0; i < 100; i++) {
