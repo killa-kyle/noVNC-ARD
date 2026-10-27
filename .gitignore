@@ -25,3 +25,7 @@ private/
 # Build artifacts
 dist/
 *.tgz
+
+# Swift Package build products
+.build/
+.swiftpm/
