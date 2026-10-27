@@ -43,7 +43,10 @@ connect takes the same session string first; stale sessions throw.
 - `key(session, keysym, down)`, `type(session, text)` (Unicode keysyms),
   `pointer(session, framebufferX, framebufferY)` (move without held buttons).
 - `clipboard(session, operation, text?)`: `send`, `get`, `revoke`. Revoke clears
-  remembered outgoing content even in Observe mode. No browser clipboard access.
+  remembered outgoing content and received generic text even in Observe mode.
+  Generic RFB get returns the last received server text (cached:true); RFB cannot
+  request a fresh ordinary ServerCutText. With no cached value it emits
+  clipboardUnavailable. No browser clipboard access.
 - `curtain(session, active, message?)`: upstream's curtain event is a local
   requested state, not proof the server has hidden its physical display.
 - `selectSession(session, 1|2)`: share/private, only as offered in a session event.
@@ -73,7 +76,11 @@ No RSA key is silently trusted or stored in WebKit localStorage. The adapter
 pauses RSA credential encryption until native approval. Type 30 DH lacks a
 stable authenticated server identity and therefore fails unless native already
 provides a verified SSH transport. Avoid relabeling encryption as authentication.
-Clipboard currently supports text, not rich flavors. Server-rendered content and
+Clipboard currently supports text, not rich flavors. Standard RFB uses its
+ordinary clipboardPasteFrom path, whose legacy ClientCutText is Latin-1 unless
+extended-clipboard support is negotiated. Entering Observe clears both received
+and outgoing clipboard caches, preventing delayed extended-clipboard requests
+from serving remembered outgoing text. Server-rendered content and
 metadata remain untrusted. This wrapper has no production-host validation yet.
 
 `swift test` checks resource lookup, the full bootstrap static import graph,

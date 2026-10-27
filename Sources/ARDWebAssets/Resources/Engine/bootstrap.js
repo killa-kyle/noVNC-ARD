@@ -102,6 +102,7 @@ RFB.prototype._writeClipboard = function (text) {
     const state = active;
     if (state && state.rfb === this && !this.viewOnly && typeof text === 'string') {
         if (text.length > 1024 * 1024) { fail(state, 'Oversized remote clipboard'); return; }
+        if (!this._rfbAppleARD) state.lastGenericClipboard = text;
         event(state, 'clipboard', {text});
     }
 };
@@ -123,7 +124,7 @@ const api = {
         const state = {
             id: config.session, identity: config.identity, transportTrusted: config.transportTrusted === true,
             outgoing: [], queuedBytes: 0, incoming: [], incomingBytes: 0, sequence: 0,
-            outstanding: null, rfb: null, channel: null, trustResolve: null, trust: null,
+            outstanding: null, rfb: null, channel: null, trustResolve: null, trust: null, lastGenericClipboard: null,
         };
         active = state;
         state.channel = channelFor(state);
@@ -230,13 +231,19 @@ const api = {
     clipboard(session, operation, text = '') {
         const state = requireSession(session);
         if (operation === 'revoke') {
-            state.rfb._ardClipboardOutgoing = null; state.rfb._clipboardText = null; return;
+            state.rfb._ardClipboardOutgoing = null; state.rfb._clipboardText = null;
+            state.lastGenericClipboard = null; return;
         }
         if (state.rfb.viewOnly) return;
-        if (operation === 'get') state.rfb.requestRemoteClipboard();
+        if (operation === 'get') {
+            if (state.rfb._rfbAppleARD) state.rfb.requestRemoteClipboard();
+            else if (state.lastGenericClipboard !== null)
+                event(state, 'clipboard', {text: state.lastGenericClipboard, cached: true});
+            else event(state, 'clipboardUnavailable', {reason: 'The RFB server has not sent clipboard content since it was cleared.'});
+        }
         else if (operation === 'send') {
             if (typeof text !== 'string' || text.length > 1024 * 1024) throw new Error('Oversized clipboard');
-            state.rfb.forceClipboardPaste(text);
+            state.rfb.clipboardPasteFrom(text);
         } else throw new Error('Unknown clipboard operation');
     },
     curtain(session, active, message = '') {
@@ -254,7 +261,10 @@ const api = {
     },
     selectDisplay(session, id) { requireSession(session).rfb.ardSelectedDisplay = id; },
     observe(session, enabled) {
-        const rfb = requireSession(session).rfb;
+        const state = requireSession(session); const rfb = state.rfb;
+        if (enabled === true) {
+            rfb._ardClipboardOutgoing = null; rfb._clipboardText = null; state.lastGenericClipboard = null;
+        }
         if (enabled === true && !rfb.viewOnly) {
             // Release DOM hardware keys/buttons before viewOnly starts gating output.
             rfb._keyboard.ungrab();
