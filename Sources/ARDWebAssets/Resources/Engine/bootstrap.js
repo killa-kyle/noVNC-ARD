@@ -254,7 +254,14 @@ const api = {
     },
     selectDisplay(session, id) { requireSession(session).rfb.ardSelectedDisplay = id; },
     observe(session, enabled) {
-        const rfb = requireSession(session).rfb; rfb.viewOnly = enabled === true;
+        const rfb = requireSession(session).rfb;
+        if (enabled === true && !rfb.viewOnly) {
+            // Release DOM hardware keys/buttons before viewOnly starts gating output.
+            rfb._keyboard.ungrab();
+            if (rfb._mouseButtonMask) rfb._sendMouse(rfb._mousePos.x, rfb._mousePos.y, 0);
+            rfb._mouseButtonMask = 0;
+        }
+        rfb.viewOnly = enabled === true;
         rfb.ardControlMode = enabled === true ? 0 : 1;
     },
     quality(session, preset) {

@@ -399,7 +399,7 @@ RFB.prototype._negotiateServerInit = function () {
 // size of the screen is known.
 RFB.prototype._ardSendSessionSetup = function () {
     RFB.messages.ardViewerInfo(this._sock);
-    RFB.messages.ardSetMode(this._sock, this._ardControlMode || 1);
+    RFB.messages.ardSetMode(this._sock, this._ardControlMode ?? 1);
     this._ardHpRequestVirtualDisplay();
     RFB.messages.ardSetDisplay(this._sock, this._ardSelectedDisplay);
     RFB.messages.ardAutoPasteboard(this._sock, 1);

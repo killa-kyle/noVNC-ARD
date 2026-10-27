@@ -6,7 +6,8 @@ Upstream noVNC-ARD: d699293635083c9e0c30c8f9480993865653772a.
 Upstream noVNC core: 8e1ebdffba02e651c399dacef841f8941f6ad6e4.
 The resource tree materializes core and vendor/pako, rather than relying on a
 consumer's submodule checkout. Optional HP audio/WASM/relay assets are excluded.
-The packaged ARD patch changes its optional audio factory to null. High
+The packaged ARD patch changes its optional audio factory to null and preserves
+explicit mode 0 instead of defaulting it to Control mode. High
 Performance is hard-disabled; MVS adaptive framebuffer quality remains available.
 
 Import `ARDWebAssets`; load `ARDWebAssets.indexURL`, with read access restricted
