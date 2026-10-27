@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import ARDWebAssets
 
 final class ARDWebAssetsTests: XCTestCase {
@@ -46,5 +47,15 @@ final class ARDWebAssetsTests: XCTestCase {
     XCTAssertTrue(source.contains("_ardGetCachedRSAKey = () => null"))
     let html = try String(contentsOf: ARDWebAssets.indexURL, encoding: .utf8)
     XCTAssertTrue(html.contains("connect-src 'none'"))
+    XCTAssertTrue(html.contains("<script src=\"bootstrap.bundle.js\"></script>"))
+    XCTAssertFalse(html.contains("type=\"module\""))
+    let bundle = try Data(contentsOf: ARDWebAssets.bundleURL.appendingPathComponent("bootstrap.bundle.js"))
+    let digest = SHA256.hash(data: bundle).map { String(format: "%02x", $0) }.joined()
+    let expected = try String(contentsOf: ARDWebAssets.bundleURL.appendingPathComponent("bootstrap.bundle.sha256"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+    XCTAssertEqual(digest, expected)
+    let compiled = String(decoding: bundle, as: UTF8.self)
+    XCTAssertTrue(compiled.contains("window.KyleARD"))
+    XCTAssertTrue(compiled.contains("Mozilla Public License") || compiled.contains("MPL-2.0"))
+    XCTAssertTrue(compiled.contains("Copyright (C) 2014-2016 by Vitaly Puzrin"))
   }
 }

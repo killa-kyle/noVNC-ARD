@@ -1,5 +1,13 @@
 {
   "private": true,
   "type": "module",
-  "version": "1.1.2+1.6.0"
+  "version": "1.1.2+1.6.0",
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native-bundle.mjs",
+    "check:native": "node scripts/build-native-bundle.mjs --check",
+    "test:bridge": "node --test Tests/Bridge/*.test.mjs"
+  }
 }

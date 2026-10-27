@@ -12,7 +12,7 @@ Performance is hard-disabled; MVS adaptive framebuffer quality remains available
 
 Import `ARDWebAssets`; load `ARDWebAssets.indexURL`, with read access restricted
 to `ARDWebAssets.bundleURL` (the Engine directory). Assets are all local. WebKit
-module loading and WebCrypto availability still require actual platform validation;
+classic-script loading and WebCrypto availability still require actual platform validation;
 the offline resource tests do not establish either. Do not enable unsupported
 file access preferences or fetch scripts over the network.
 
@@ -86,3 +86,21 @@ metadata remain untrusted. This wrapper has no production-host validation yet.
 `swift test` checks resource lookup, the full bootstrap static import graph,
 asset exclusions, and bridge entry points on macOS. It does not execute a remote
 session. Source tests and all original notices remain available in this branch.
+
+## Reproducible classic bundle
+
+The index loads `bootstrap.bundle.js` as an ordinary script because file-origin
+ES-module loading failed in the observed Duo WebKit environment despite readable
+resources and available WebCrypto. This is a candidate remedy, not proof until
+the same native environment is rerun. Original MPL source resources remain
+packaged; inline legal headers and the pako MIT notice are preserved in the
+bundle. No HTTP server, external script loading or security preference override
+is introduced.
+
+Use `npm ci --ignore-scripts` then `npm run build:native` with esbuild pinned to
+0.25.12 in package-lock.json. `npm run check:native` reproduces the bytes and
+verifies the checked-in SHA256. The build has no timestamp or source-map path
+input. Upstream top-level await runs inside an async IIFE, preserving capability
+detection order without requiring any browser ES-module loading. A startupError
+message reports exceptions before the normal ready event. Swift package tests verify the classic index, resource presence and
+compiled bundle hash; they do not execute its browser code.
