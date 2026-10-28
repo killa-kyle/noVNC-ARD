@@ -104,3 +104,25 @@ input. Upstream top-level await runs inside an async IIFE, preserving capability
 detection order without requiring any browser ES-module loading. A startupError
 message reports exceptions before the normal ready event. Swift package tests verify the classic index, resource presence and
 compiled bundle hash; they do not execute its browser code.
+
+## Performance-only branch
+
+This branch starts from the deployed classic-script revision 462ca31 and adds
+instrumentation only. It deliberately retains that revision's text clipboard,
+password-handling, transport chunking, rendering and quality behavior. Rich
+archive implementation remains separately on swift-package-assets at fd541b4.
+
+`performance(session)` returns cumulative bounded metadata: elapsedMs,
+receivedBytes, framebufferUpdates, rectangleCalls, rectanglesCompleted,
+decodeMilliseconds, encodings (at most 64 IDs, each rectangles/milliseconds),
+width, height, renderPending, canvasDrawFlips, canvasFlipMilliseconds,
+flushCompletions, flushWaitMilliseconds. The adapter also emits a performance
+event every 1,000 ms only while connected and cancels its timer on closure.
+No host, username, credentials, image or clipboard contents are included.
+
+Successful framebuffer-update calls count protocol updates, including metadata
+or empty updates, not presented-frame FPS. Decoder timing accumulates synchronous
+partial work; completed rectangles increment only when the decoder returns true.
+Draw-bearing canvas flips and their synchronous elapsed time are measured
+separately from completed flush waits. Metrics identify where time is spent;
+they do not establish a faster quality preset or diagnose a bottleneck alone.

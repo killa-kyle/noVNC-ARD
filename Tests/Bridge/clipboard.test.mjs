@@ -1,46 +1,9 @@
 // Exercise the original native adapter against a protocol-engine test double.
 // This verifies dispatch/privacy semantics, not a real VNC wire or Mac server.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { webcrypto } from 'node:crypto';
 import { test } from 'node:test';
-import vm from 'node:vm';
+import { fixture } from './fixture.mjs';
 
-function fixture() {
-    const messages = [];
-    const instances = [];
-    class RFB {
-        constructor() {
-            this._asyncClipboard = {ungrab() {}};
-            this._keyboard = {ungrab() {}};
-            this._mouseButtonMask = 0;
-            this._rfbAppleARD = false;
-            this.listeners = {};
-            this.sent = [];
-            this.requests = 0;
-            instances.push(this);
-        }
-        addEventListener(name, handler) { this.listeners[name] = handler; }
-        disconnect() {}
-        clipboardPasteFrom(text) { this.sent.push(text); this._clipboardText = text; }
-        forceClipboardPaste() { throw new Error('ARD-only API must not be used for generic clipboard'); }
-        requestRemoteClipboard() { this.requests++; }
-        _resize() {}
-        _negotiateRSATunnelAuthAsync() {}
-        _negotiateARDAuthAsync() {}
-    }
-    const window = {crypto: webcrypto, isSecureContext: true,
-        webkit: {messageHandlers: {kyleARD: {postMessage(body) { messages.push(JSON.parse(JSON.stringify(body))); }}}}};
-    const context = vm.createContext({RFB, window, document: {getElementById() { return {}; }},
-        TextEncoder, Uint8Array, ArrayBuffer, setTimeout, btoa, atob});
-    const source = readFileSync(new URL('../../Sources/ARDWebAssets/Resources/Engine/bootstrap.js', import.meta.url), 'utf8')
-        .replace(/^import .*;\n/gm, '');
-    vm.runInContext(source, context);
-    const api = window.KyleARD;
-    api.connect({session: 'test-session', identity: 'fixed-host:5900'});
-    return {api, rfb: instances[0], messages,
-        clipboardEvents: () => messages.filter(message => message.event === 'clipboard')};
-}
 
 test('generic send chooses standard engine API and get uses last received server text', () => {
     const {api, rfb, clipboardEvents} = fixture();

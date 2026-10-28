@@ -21422,6 +21422,55 @@ var drain = (state) => {
   state.outstanding = { sequence, length: bytes.length };
   post({ type: "write", session: state.id, sequence, base64: bytesToBase64(bytes) });
 };
+function performanceSnapshot(state) {
+  return {
+    elapsedMs: Math.max(0, performance.now() - state.started),
+    receivedBytes: state.stats.receivedBytes,
+    framebufferUpdates: state.stats.framebufferUpdates,
+    rectangleCalls: state.stats.rectangleCalls,
+    rectanglesCompleted: state.stats.rectanglesCompleted,
+    decodeMilliseconds: state.stats.decodeMilliseconds,
+    encodings: state.stats.encodings,
+    canvasDrawFlips: state.stats.canvasDrawFlips,
+    canvasFlipMilliseconds: state.stats.canvasFlipMilliseconds,
+    flushCompletions: state.stats.flushCompletions,
+    flushWaitMilliseconds: state.stats.flushWaitMilliseconds,
+    width: state.rfb?._fbWidth || 0,
+    height: state.rfb?._fbHeight || 0,
+    renderPending: !!state.rfb?._display?.pending?.()
+  };
+}
+function installDisplayMetrics(state) {
+  const display = state.rfb._display;
+  if (typeof display?.flip === "function") {
+    const original = display.flip;
+    display.flip = function(fromQueue) {
+      const draw = (fromQueue || !this.pending()) && this._damageBounds && this._damageBounds.right > this._damageBounds.left && this._damageBounds.bottom > this._damageBounds.top;
+      const started = performance.now();
+      try {
+        return original.call(this, fromQueue);
+      } finally {
+        if (draw && active === state) {
+          state.stats.canvasDrawFlips++;
+          state.stats.canvasFlipMilliseconds += Math.max(0, performance.now() - started);
+        }
+      }
+    };
+  }
+  if (typeof display?.flush === "function") {
+    const original = display.flush;
+    display.flush = function(...args) {
+      const started = performance.now();
+      return original.apply(this, args).then((value) => {
+        if (active === state) {
+          state.stats.flushCompletions++;
+          state.stats.flushWaitMilliseconds += Math.max(0, performance.now() - started);
+        }
+        return value;
+      });
+    };
+  }
+}
 function channelFor(state) {
   return {
     readyState: "connecting",
@@ -21450,6 +21499,8 @@ function channelFor(state) {
     close() {
       if (this.readyState === "closed") return;
       this.readyState = "closed";
+      clearInterval(state.performanceTimer);
+      state.performanceTimer = null;
       state.outgoing = [];
       state.incoming = [];
       state.queuedBytes = 0;
@@ -21493,6 +21544,38 @@ RFB.prototype._negotiateARDAuthAsync = function(...args) {
   }
   return originalDH.apply(this, args);
 };
+var originalFrameUpdate = RFB.prototype._framebufferUpdate;
+RFB.prototype._framebufferUpdate = function(...args) {
+  const complete = originalFrameUpdate.apply(this, args);
+  if (complete && active?.rfb === this) active.stats.framebufferUpdates++;
+  return complete;
+};
+var originalHandleRect = RFB.prototype._handleRect;
+RFB.prototype._handleRect = function(...args) {
+  const state = active;
+  const encoding = this._FBU?.encoding;
+  const started = performance.now();
+  let complete = false;
+  try {
+    complete = originalHandleRect.apply(this, args);
+    return complete;
+  } finally {
+    if (state && state === active && state.rfb === this) {
+      const elapsed = Math.max(0, performance.now() - started);
+      state.stats.rectangleCalls++;
+      state.stats.decodeMilliseconds += elapsed;
+      const key = String(encoding);
+      if (!(key in state.stats.encodings) && Object.keys(state.stats.encodings).length < 64)
+        state.stats.encodings[key] = { rectangles: 0, milliseconds: 0 };
+      const metric = state.stats.encodings[key];
+      if (metric) {
+        metric.milliseconds += elapsed;
+        if (complete) metric.rectangles++;
+      }
+      if (complete) state.stats.rectanglesCompleted++;
+    }
+  }
+};
 RFB.prototype._writeClipboard = function(text) {
   const state = active;
   if (state && state.rfb === this && !this.viewOnly && typeof text === "string") {
@@ -21535,7 +21618,21 @@ var api = {
       channel: null,
       trustResolve: null,
       trust: null,
-      lastGenericClipboard: null
+      lastGenericClipboard: null,
+      started: performance.now(),
+      performanceTimer: null,
+      stats: {
+        receivedBytes: 0,
+        framebufferUpdates: 0,
+        rectangleCalls: 0,
+        rectanglesCompleted: 0,
+        decodeMilliseconds: 0,
+        encodings: /* @__PURE__ */ Object.create(null),
+        canvasDrawFlips: 0,
+        canvasFlipMilliseconds: 0,
+        flushCompletions: 0,
+        flushWaitMilliseconds: 0
+      }
     };
     active = state;
     state.channel = channelFor(state);
@@ -21545,6 +21642,7 @@ var api = {
     state.rfb = new RFB(document.getElementById("desktop"), state.channel, { credentials });
     state.rfb.scaleViewport = true;
     state.rfb.resizeSession = false;
+    installDisplayMetrics(state);
     state.rfb._asyncClipboard.ungrab();
     state.rfb._asyncClipboard = { grab() {
     }, ungrab() {
@@ -21562,6 +21660,15 @@ var api = {
     const listen = (name, handler) => state.rfb.addEventListener(name, (ev) => handler(ev.detail || {}));
     listen("connect", () => {
       event(state, "connected");
+      clearInterval(state.performanceTimer);
+      state.performanceTimer = setInterval(() => {
+        if (active !== state || state.rfb._rfbConnectionState !== "connected") {
+          clearInterval(state.performanceTimer);
+          state.performanceTimer = null;
+          return;
+        }
+        event(state, "performance", performanceSnapshot(state));
+      }, 1e3);
       event(state, "resize", { width: state.rfb._fbWidth, height: state.rfb._fbHeight });
       event(state, "capabilities", {
         apple: !!state.rfb._rfbAppleARD,
@@ -21603,6 +21710,7 @@ var api = {
   receive(session, base64) {
     const state = requireSession(session);
     const bytes = fromBase64(base64);
+    state.stats.receivedBytes += bytes.length;
     if (state.channel.readyState === "connecting") {
       if (state.incomingBytes + bytes.length > MAX_QUEUE) {
         fail2(state, "Pre-open receive queue exceeded its limit");
@@ -21622,6 +21730,8 @@ var api = {
   transportClosed(session, reason = "Native transport closed") {
     const state = requireSession(session);
     if (state.channel.readyState === "closed") return;
+    clearInterval(state.performanceTimer);
+    state.performanceTimer = null;
     state.channel.readyState = "closed";
     state.trustResolve?.(false);
     state.channel.onclose({ code: 1006, reason: String(reason).slice(0, 512) });
@@ -21722,6 +21832,9 @@ var api = {
     }
     rfb.viewOnly = enabled === true;
     rfb.ardControlMode = enabled === true ? 0 : 1;
+  },
+  performance(session) {
+    return performanceSnapshot(requireSession(session));
   },
   quality(session, preset) {
     if (!["adaptive", "millions", "thousands", "gray", "halftone"].includes(preset)) throw new Error("Invalid quality preset");
