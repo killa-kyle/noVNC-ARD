@@ -7,7 +7,8 @@ export function fixture() {
     const instances = [];
     const timers = [];
     class RFB {
-        constructor() {
+        constructor(_target, channel) {
+            this.channel = channel;
             this._asyncClipboard = {ungrab() {}};
             this._keyboard = {ungrab() {}};
             this._mouseButtonMask = 0;

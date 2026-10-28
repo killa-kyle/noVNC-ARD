@@ -280,6 +280,17 @@ const api = {
         state.channel.readyState = 'closed'; state.trustResolve?.(false);
         state.channel.onclose({code: 1006, reason: String(reason).slice(0, 512)});
     },
+    // Wait for native send acknowledgments before the caller closes the channel.
+    // Bounded: a failed peer must never hold an application lifecycle transition.
+    async flush(session) {
+        const state = requireSession(session);
+        const deadline = performance.now() + 1000;
+        while (active === state && state.channel.readyState !== 'closed' && state.queuedBytes > 0) {
+            if (performance.now() >= deadline) return false;
+            await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        return active === state && state.channel.readyState !== 'closed' && state.queuedBytes === 0;
+    },
     disconnect(session) { const state = requireSession(session); state.rfb.disconnect(); state.channel.close(); },
     credentials(session, username, password) { requireSession(session).rfb.sendCredentials({username, password}); },
     trust(session, accepted) {
