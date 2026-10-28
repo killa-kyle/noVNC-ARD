@@ -126,3 +126,5 @@ partial work; completed rectangles increment only when the decoder returns true.
 Draw-bearing canvas flips and their synchronous elapsed time are measured
 separately from completed flush waits. Metrics identify where time is spent;
 they do not establish a faster quality preset or diagnose a bottleneck alone.
+
+Rich Apple pasteboard archive support is merged with the native transport flush, pointer-mask, and performance instrumentation paths. The explicit chunked archive API retains the bounded codec and Observe/revoke gates; native integration and actual Mac transfer require separate acceptance.

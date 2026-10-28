@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { webcrypto } from 'node:crypto';
 import vm from 'node:vm';
+import * as codec from '../../Sources/ARDWebAssets/Resources/Engine/clipboard-codec.js';
 
 export function fixture() {
     const messages = [];
@@ -24,6 +25,7 @@ export function fixture() {
         }
         addEventListener(name, handler) { this.listeners[name] = handler; }
         _sendMouse(x, y, mask) { (this.pointerEvents ||= []).push({x,y,mask}); }
+        _fail(reason) { this.failure = reason; return false; }
         disconnect() {}
         clipboardPasteFrom(text) { this.sent.push(text); this._clipboardText = text; }
         forceClipboardPaste() { throw new Error('ARD-only API must not be used for generic clipboard'); }
@@ -34,10 +36,13 @@ export function fixture() {
         _negotiateRSATunnelAuthAsync() {}
         _negotiateARDAuthAsync() {}
     }
+    RFB.messages = {ardClipboardSend(sock, format, session, bytes, expanded) {
+        sock.sentArchive = {format, session, bytes, expanded};
+    }};
     const window = {crypto: webcrypto, isSecureContext: true,
         webkit: {messageHandlers: {kyleARD: {postMessage(body) { messages.push(JSON.parse(JSON.stringify(body))); }}}}};
     const context = vm.createContext({RFB, window, document: {getElementById() { return {}; }},
-        TextEncoder, Uint8Array, ArrayBuffer, setTimeout, btoa, atob, performance,
+        TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, setTimeout, btoa, atob, performance, ...codec,
         setInterval(fn, ms) { const timer = {fn, ms, cancelled: false}; timers.push(timer); return timer; },
         clearInterval(timer) { if (timer) timer.cancelled = true; }});
     const source = readFileSync(new URL('../../Sources/ARDWebAssets/Resources/Engine/bootstrap.js', import.meta.url), 'utf8')
@@ -45,7 +50,7 @@ export function fixture() {
     vm.runInContext(source, context);
     const api = window.KyleARD;
     api.connect({session: 'test-session', identity: 'fixed-host:5900'});
-    return {api, rfb: instances[0], messages, timers,
+    return {api, rfb: instances[0], messages, timers, context,
         clipboardEvents: () => messages.filter(message => message.event === 'clipboard')};
 }
 

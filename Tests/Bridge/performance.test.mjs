@@ -18,7 +18,6 @@ test('performance counters distinguish network bytes, partial decoder work and c
     assert.equal(stats.rectanglesCompleted, 1); assert.equal(stats.encodings['1011'].rectangles, 1);
     assert.equal(stats.framebufferUpdates, 1); assert.ok(stats.decodeMilliseconds >= 0);
     assert.equal(stats.width, 100); assert.equal(stats.height, 50);
-    assert.equal(api.clipboardArchiveBegin, undefined, 'performance branch must not add rich behavior');
 });
 
 test('draw-bearing flips and flush completion waits are measured separately', async () => {

@@ -402,7 +402,7 @@ async function _checkWebCodecsH264DecodeSupport() {
   ));
   let gotframe = false;
   let error = null;
-  let decoder = new VideoDecoder({
+  let decoder2 = new VideoDecoder({
     output: (frame) => {
       gotframe = true;
       frame.close();
@@ -416,10 +416,10 @@ async function _checkWebCodecsH264DecodeSupport() {
     type: "key",
     data
   });
-  decoder.configure(config);
-  decoder.decode(chunk);
+  decoder2.configure(config);
+  decoder2.decode(chunk);
   try {
-    await decoder.flush();
+    await decoder2.flush();
   } catch (e2) {
     error = e2;
   }
@@ -2849,6 +2849,17 @@ function inflate(strm, flush) {
     ret = Z_BUF_ERROR;
   }
   return ret;
+}
+function inflateEnd(strm) {
+  if (!strm || !strm.state) {
+    return Z_STREAM_ERROR;
+  }
+  var state = strm.state;
+  if (state.window) {
+    state.window = null;
+  }
+  strm.state = null;
+  return Z_OK;
 }
 
 // Sources/ARDWebAssets/Resources/Engine/noVNC/vendor/pako/lib/zlib/zstream.js
@@ -14109,13 +14120,13 @@ var RFB = class _RFB extends EventTargetMixin {
     return true;
   }
   _handleDataRect() {
-    let decoder = this._decoders[this._FBU.encoding];
-    if (!decoder) {
+    let decoder2 = this._decoders[this._FBU.encoding];
+    if (!decoder2) {
       this._fail("Unsupported encoding (encoding: " + this._FBU.encoding + ")");
       return false;
     }
     try {
-      return decoder.decodeRect(
+      return decoder2.decodeRect(
         this._FBU.x,
         this._FBU.y,
         this._FBU.width,
@@ -19717,7 +19728,9 @@ RFB.prototype._ardHandleStateChange = function() {
       );
       break;
     case statePasteboardDataNeeded:
-      if (this._ardClipboardOutgoing) {
+      if (!this._viewOnly && this._kyleClipboardArchiveOutgoing && this.kyleSendPasteboardArchive) {
+        this.kyleSendPasteboardArchive(this._kyleClipboardArchiveOutgoing);
+      } else if (!this._viewOnly && this._ardClipboardOutgoing) {
         this._ardSendClipboard(this._ardClipboardOutgoing);
       }
       break;
@@ -21385,6 +21398,104 @@ function ardUpdateInfoPanel(rfb) {
 }
 Info("ARD: Protocol patch applied to RFB.prototype (Layer 1 + Layer 2b)");
 
+// Sources/ARDWebAssets/Resources/Engine/clipboard-codec.js
+var ARCHIVE_LIMIT = 8 * 1024 * 1024;
+var FLAVOR_LIMIT = 4 * 1024 * 1024;
+var ITEM_LIMIT = 64;
+var ALIAS_LIMIT = 16;
+var NAME_LIMIT = 1024;
+var decoder = new TextDecoder("utf-8", { fatal: true });
+var encoder = new TextEncoder();
+function bounded(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length > ARCHIVE_LIMIT)
+    throw new Error("Invalid or oversized pasteboard archive");
+}
+function validateArchive(bytes) {
+  bounded(bytes);
+  if (!bytes.length) return [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  const u32 = () => {
+    if (bytes.length - offset < 4) throw new Error("Truncated pasteboard integer");
+    const value = view.getUint32(offset);
+    offset += 4;
+    return value;
+  };
+  const field = (maximum) => {
+    const length = u32();
+    if (length > maximum || length > bytes.length - offset)
+      throw new Error("Oversized or truncated pasteboard field");
+    const value = bytes.subarray(offset, offset + length);
+    offset += length;
+    return value;
+  };
+  const name = () => {
+    const value = field(NAME_LIMIT);
+    if (!value.length || value.includes(0)) throw new Error("Invalid pasteboard type name");
+    return decoder.decode(value);
+  };
+  const count = u32();
+  if (count > ITEM_LIMIT) throw new Error("Too many pasteboard items");
+  const items = [];
+  for (let item = 0; item < count; item++) {
+    const type = name();
+    const reserved = u32();
+    const count2 = u32();
+    if (count2 > ALIAS_LIMIT) throw new Error("Too many pasteboard aliases");
+    const aliases = [];
+    for (let alias = 0; alias < count2; alias++) aliases.push({ name: name(), value: field(FLAVOR_LIMIT) });
+    items.push({ type, reserved, aliases, data: field(FLAVOR_LIMIT) });
+  }
+  if (offset !== bytes.length) throw new Error("Trailing pasteboard bytes");
+  return items;
+}
+function clipboardHeader(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length !== 16 || bytes[0] !== 31)
+    throw new Error("Invalid pasteboard message header");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const session = view.getUint32(4);
+  const expanded = view.getUint32(8);
+  const compressed = view.getUint32(12);
+  if (expanded > ARCHIVE_LIMIT || compressed > ARCHIVE_LIMIT || !compressed && expanded)
+    throw new Error("Oversized or inconsistent pasteboard message");
+  return { session, expanded, compressed };
+}
+function decompressArchive(compressed, expected) {
+  bounded(compressed);
+  if (!Number.isInteger(expected) || expected < 0 || expected > ARCHIVE_LIMIT)
+    throw new Error("Oversized expanded pasteboard archive");
+  if (!compressed.length) {
+    if (expected) throw new Error("Missing compressed pasteboard");
+    return new Uint8Array();
+  }
+  const stream = new ZStream();
+  if (inflateInit(stream) !== 0) throw new Error("Cannot initialize pasteboard inflater");
+  try {
+    const output = new Uint8Array(expected + 1);
+    stream.input = compressed;
+    stream.next_in = 0;
+    stream.avail_in = compressed.length;
+    stream.output = output;
+    stream.next_out = 0;
+    stream.avail_out = output.length;
+    const status = inflate(stream, 0);
+    const flushed = compressed.length >= 4 && compressed.at(-4) === 0 && compressed.at(-3) === 0 && compressed.at(-2) === 255 && compressed.at(-1) === 255;
+    if (status < 0 || stream.next_out !== expected || stream.avail_in !== 0 || status !== 1 && !flushed)
+      throw new Error("Invalid or mismatched compressed pasteboard");
+    const result = output.slice(0, expected);
+    validateArchive(result);
+    return result;
+  } finally {
+    inflateEnd(stream);
+  }
+}
+function compressArchive(bytes) {
+  validateArchive(bytes);
+  const result = new Deflator().deflate(bytes);
+  if (result.length > ARCHIVE_LIMIT) throw new Error("Compressed pasteboard exceeds limit");
+  return result.slice();
+}
+
 // Sources/ARDWebAssets/Resources/Engine/bootstrap.js
 var MAX_CHUNK = 65536;
 var MAX_QUEUE = 8 * 1024 * 1024;
@@ -21471,6 +21582,15 @@ function installDisplayMetrics(state) {
     };
   }
 }
+function clearArchives(state) {
+  state.inboundArchive = null;
+  state.outboundArchive = null;
+  if (state.rfb) state.rfb._kyleClipboardArchiveOutgoing = null;
+}
+function requireAppleControl(state) {
+  if (state.rfb.viewOnly || !state.rfb._rfbAppleARD || state.rfb._rfbConnectionState !== "connected")
+    throw new Error("Rich pasteboard requires a connected Apple Control session");
+}
 function channelFor(state) {
   return {
     readyState: "connecting",
@@ -21503,6 +21623,14 @@ function channelFor(state) {
       state.performanceTimer = null;
       state.outgoing = [];
       state.incoming = [];
+      clearInterval(state.performanceTimer);
+      state.performanceTimer = null;
+      clearArchives(state);
+      state.lastGenericClipboard = null;
+      if (state.rfb) {
+        state.rfb._ardClipboardOutgoing = null;
+        state.rfb._clipboardText = null;
+      }
       state.queuedBytes = 0;
       state.incomingBytes = 0;
       state.trustResolve?.(false);
@@ -21576,6 +21704,39 @@ RFB.prototype._handleRect = function(...args) {
     }
   }
 };
+RFB.prototype._ardHandleServerClipboard = function() {
+  if (this._sock.rQwait("Apple pasteboard header", 15)) return false;
+  try {
+    const headerBytes = new Uint8Array(16);
+    headerBytes[0] = 31;
+    headerBytes.set(this._sock.rQpeekBytes(15), 1);
+    const header = clipboardHeader(headerBytes);
+    if (this._sock.rQwait("Apple pasteboard payload", 15 + header.compressed)) return false;
+    this._sock.rQskipBytes(15);
+    this._ardClipboardSessionId = header.session;
+    const compressed = this._sock.rQshiftBytes(header.compressed);
+    const state = active;
+    if (!state || state.rfb !== this || this.viewOnly) return true;
+    const bytes = decompressArchive(compressed, header.expanded);
+    const transfer = window.crypto.randomUUID();
+    state.inboundArchive = { transfer, bytes };
+    event(state, "clipboardArchive", { transfer, length: bytes.length });
+    return true;
+  } catch (error) {
+    return this._fail("Invalid Apple pasteboard: " + String(error.message).slice(0, 256));
+  }
+};
+RFB.prototype.kyleSendPasteboardArchive = function(bytes) {
+  if (this.viewOnly || this._rfbConnectionState !== "connected") return;
+  const compressed = compressArchive(bytes);
+  RFB.messages.ardClipboardSend(this._sock, 0, this._ardClipboardSessionId, compressed, bytes.length);
+};
+var originalSendClipboard = RFB.prototype._ardSendClipboard;
+RFB.prototype._ardSendClipboard = function(text) {
+  if (this.viewOnly || this._rfbConnectionState !== "connected") return;
+  this._kyleClipboardArchiveOutgoing = null;
+  return originalSendClipboard.call(this, text);
+};
 RFB.prototype._writeClipboard = function(text) {
   const state = active;
   if (state && state.rfb === this && !this.viewOnly && typeof text === "string") {
@@ -21619,6 +21780,8 @@ var api = {
       trustResolve: null,
       trust: null,
       lastGenericClipboard: null,
+      inboundArchive: null,
+      outboundArchive: null,
       started: performance.now(),
       performanceTimer: null,
       stats: {
@@ -21675,7 +21838,7 @@ var api = {
         curtain: !!state.rfb._rfbAppleARD,
         adaptive: !!state.rfb._rfbAppleARD,
         textClipboard: true,
-        richClipboard: false
+        richClipboard: !!state.rfb._rfbAppleARD
       });
     });
     listen("disconnect", (detail) => event(state, "disconnected", { reason: detail.clean ? "Disconnected" : "Connection closed unexpectedly" }));
@@ -21732,6 +21895,10 @@ var api = {
     if (state.channel.readyState === "closed") return;
     clearInterval(state.performanceTimer);
     state.performanceTimer = null;
+    clearArchives(state);
+    state.lastGenericClipboard = null;
+    state.rfb._ardClipboardOutgoing = null;
+    state.rfb._clipboardText = null;
     state.channel.readyState = "closed";
     state.trustResolve?.(false);
     state.channel.onclose({ code: 1006, reason: String(reason).slice(0, 512) });
@@ -21796,6 +21963,7 @@ var api = {
       state.rfb._ardClipboardOutgoing = null;
       state.rfb._clipboardText = null;
       state.lastGenericClipboard = null;
+      clearArchives(state);
       return;
     }
     if (state.rfb.viewOnly) return;
@@ -21808,6 +21976,60 @@ var api = {
       if (typeof text !== "string" || text.length > 1024 * 1024) throw new Error("Oversized clipboard");
       state.rfb.clipboardPasteFrom(text);
     } else throw new Error("Unknown clipboard operation");
+  },
+  clipboardArchiveRead(session, transfer, offset, length) {
+    const state = requireSession(session);
+    requireAppleControl(state);
+    const archive = state.inboundArchive;
+    if (!archive || archive.transfer !== transfer) throw new Error("Stale pasteboard transfer");
+    if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0 || length > MAX_CHUNK || offset > archive.bytes.length || length > archive.bytes.length - offset)
+      throw new Error("Invalid pasteboard read range");
+    return bytesToBase64(archive.bytes.subarray(offset, offset + length));
+  },
+  clipboardArchiveRelease(session, transfer) {
+    const state = requireSession(session);
+    if (state.inboundArchive?.transfer === transfer) state.inboundArchive = null;
+  },
+  clipboardArchiveBegin(session, transfer, total) {
+    const state = requireSession(session);
+    requireAppleControl(state);
+    if (typeof transfer !== "string" || !transfer.length || transfer.length > 128 || !Number.isInteger(total) || total < 0 || total > ARCHIVE_LIMIT)
+      throw new Error("Invalid pasteboard upload");
+    state.outboundArchive = { transfer, bytes: new Uint8Array(total), offset: 0 };
+    state.rfb._kyleClipboardArchiveOutgoing = null;
+    state.rfb._ardClipboardOutgoing = null;
+    state.rfb._clipboardText = null;
+  },
+  clipboardArchiveChunk(session, transfer, offset, base64) {
+    const state = requireSession(session);
+    requireAppleControl(state);
+    const archive = state.outboundArchive;
+    if (!archive || archive.transfer !== transfer) throw new Error("Stale pasteboard upload");
+    let bytes;
+    try {
+      bytes = fromBase64(base64);
+    } catch (error) {
+      state.outboundArchive = null;
+      throw error;
+    }
+    if (!Number.isInteger(offset) || offset !== archive.offset || bytes.length > archive.bytes.length - offset) {
+      state.outboundArchive = null;
+      throw new Error("Invalid pasteboard upload order or length");
+    }
+    archive.bytes.set(bytes, offset);
+    archive.offset += bytes.length;
+  },
+  clipboardArchiveCommit(session, transfer) {
+    const state = requireSession(session);
+    requireAppleControl(state);
+    const archive = state.outboundArchive;
+    state.outboundArchive = null;
+    if (!archive || archive.transfer !== transfer || archive.offset !== archive.bytes.length)
+      throw new Error("Incomplete pasteboard upload");
+    validateArchive(archive.bytes);
+    state.rfb.kyleSendPasteboardArchive(archive.bytes);
+    state.rfb._kyleClipboardArchiveOutgoing = archive.bytes;
+    return true;
   },
   curtain(session, active2, message = "") {
     const state = requireSession(session);
@@ -21836,6 +22058,7 @@ var api = {
       rfb._ardClipboardOutgoing = null;
       rfb._clipboardText = null;
       state.lastGenericClipboard = null;
+      clearArchives(state);
     }
     if (enabled === true && !rfb.viewOnly) {
       rfb._keyboard.ungrab();
