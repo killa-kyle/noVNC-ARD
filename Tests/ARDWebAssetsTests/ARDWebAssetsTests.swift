@@ -40,7 +40,7 @@ final class ARDWebAssetsTests: XCTestCase {
 
   func testNativeBridgeEntryPointsAndSafeAssetPolicyArePackaged() throws {
     let source = try String(contentsOf: ARDWebAssets.bundleURL.appendingPathComponent("bootstrap.js"), encoding: .utf8)
-    for name in ["connect", "opened", "receive", "ack", "transportClosed", "disconnect", "credentials", "trust", "key", "pointer", "type", "clipboard", "curtain", "selectSession", "selectDisplay", "observe", "quality"] {
+    for name in ["connect", "opened", "receive", "ack", "transportClosed", "disconnect", "credentials", "trust", "key", "pointer", "type", "clipboard", "curtain", "selectSession", "selectDisplay", "observe", "quality", "performance", "clipboardArchiveRead", "clipboardArchiveRelease", "clipboardArchiveBegin", "clipboardArchiveChunk", "clipboardArchiveCommit"] {
       XCTAssertTrue(source.contains("    \(name)("), name)
     }
     XCTAssertTrue(source.contains("_ardHpAllowed = false"))

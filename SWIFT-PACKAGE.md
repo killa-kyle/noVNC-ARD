@@ -76,7 +76,8 @@ No RSA key is silently trusted or stored in WebKit localStorage. The adapter
 pauses RSA credential encryption until native approval. Type 30 DH lacks a
 stable authenticated server identity and therefore fails unless native already
 provides a verified SSH transport. Avoid relabeling encryption as authentication.
-Clipboard currently supports text, not rich flavors. Standard RFB uses its
+Apple rich archives have a bounded native bridge; remote application support
+still requires host validation. Standard RFB remains text-only and uses its
 ordinary clipboardPasteFrom path, whose legacy ClientCutText is Latin-1 unless
 extended-clipboard support is negotiated. Entering Observe clears both received
 and outgoing clipboard caches, preventing delayed extended-clipboard requests
@@ -104,3 +105,55 @@ input. Upstream top-level await runs inside an async IIFE, preserving capability
 detection order without requiring any browser ES-module loading. A startupError
 message reports exceptions before the normal ready event. Swift package tests verify the classic index, resource presence and
 compiled bundle hash; they do not execute its browser code.
+
+## Bounded rich Apple pasteboard API
+
+The Apple receive handler checks compressed and expanded lengths against 8 MiB
+**before** waiting for the payload or allocating inflation output. The inflater
+allocates at most declared size plus one sentinel byte; it rejects extra expansion,
+trailing compressed data, invalid framing, missing flush/end and archive parsing
+failures. Parsed archives allow at most 64 flavors, 16 aliases per flavor, 1024
+UTF-8 bytes per nonempty type name, 4 MiB per flavor/alias value, and 8 MiB total.
+Unknown UTIs remain opaque; native code must whitelist its supported OS types.
+
+On receipt, event `clipboardArchive` has `{transfer, length}`. It replaces the
+previous received archive; no entire image is posted through WKScriptMessageHandler.
+
+- `clipboardArchiveRead(session, transfer, offset, length)` returns base64 for a
+  maximum of 65,536 bytes. Native pulls sequentially and bounds its own assembly.
+- `clipboardArchiveRelease(session, transfer)` clears the received bytes.
+- `clipboardArchiveBegin(session, transfer, total)` allocates an upload capped at
+  8 MiB and immediately revokes previously approved outgoing rich/text data.
+- `clipboardArchiveChunk(session, transfer, offset, base64)` accepts at most 64 KiB
+  decoded bytes and requires an exact next offset. A malformed chunk aborts upload.
+- `clipboardArchiveCommit(session, transfer)` requires all declared bytes, validates
+  the archive before compression, queues the Apple 0x1f message and returns true.
+  True means queued, not confirmation that the Mac applied its pasteboard.
+
+These APIs require an Apple session connected in Control mode. Ordinary RFB
+continues to use text-only clipboard APIs. Observe/revoke/transport close clears
+received, pending-upload and approved-outgoing archives and text caches. Delayed
+server data-needed messages may only use the current approved cache in Control
+mode. A newer text send supersedes a previously approved rich archive. Each
+archive is bounded; a session can hold one incoming, one pending upload and one
+approved outgoing archive, each at most 8 MiB. No browser clipboard API is used.
+
+Ten Node tests cover codec compression/opaque rich flavors, synthetic wire
+headers, malformed/truncated records, expansion-bound rejection, pull/upload
+chunks, release/revoke/Observe/close, standard RFB fallback and performance
+counters. They execute the original codec/adapter with a protocol-engine test
+double; they are not real-Mac interoperability evidence.
+
+## Performance observations
+
+`performance(session)` returns bounded metadata only: elapsedMs, receivedBytes,
+framebufferUpdates, rectangleCalls, rectanglesCompleted, decodeMilliseconds,
+encodings (up to 64 IDs, each rectangles/milliseconds), width, height, renderPending,
+canvasDrawFlips, canvasFlipMilliseconds, flushCompletions and flushWaitMilliseconds.
+The adapter also emits `performance` at most once per second while connected.
+Counters are cumulative within a session. No host, user, credentials, clipboard
+or image contents are included. Successful framebuffer-update calls count server
+updates, including metadata/empty updates; they are not presented-frame FPS.
+Decoder timing includes synchronous partial work; completed rectangles count
+only successful calls. Canvas metrics count draw-bearing flips and their
+synchronous time; flush metrics count completed flush waits, not frame displays.

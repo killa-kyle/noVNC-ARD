@@ -1,6 +1,7 @@
 // Original KyleVNC adapter. Upstream noVNC/ARD code remains in its MPL files.
 import RFB from './noVNC/core/rfb.js';
 import './ard/ard-patch.js';
+import { ARCHIVE_LIMIT, validateArchive, clipboardHeader, decompressArchive, compressArchive } from './clipboard-codec.js';
 
 const MAX_CHUNK = 65536;
 const MAX_QUEUE = 8 * 1024 * 1024;
@@ -38,6 +39,50 @@ const drain = state => {
     state.outstanding = {sequence, length: bytes.length};
     post({type: 'write', session: state.id, sequence, base64: bytesToBase64(bytes)});
 };
+function performanceSnapshot(state) {
+    return {elapsedMs: Math.max(0, performance.now() - state.started),
+        receivedBytes: state.stats.receivedBytes, framebufferUpdates: state.stats.framebufferUpdates,
+        rectangleCalls: state.stats.rectangleCalls, rectanglesCompleted: state.stats.rectanglesCompleted,
+        decodeMilliseconds: state.stats.decodeMilliseconds, encodings: state.stats.encodings,
+        canvasDrawFlips: state.stats.canvasDrawFlips, canvasFlipMilliseconds: state.stats.canvasFlipMilliseconds,
+        flushCompletions: state.stats.flushCompletions, flushWaitMilliseconds: state.stats.flushWaitMilliseconds,
+        width: state.rfb?._fbWidth || 0, height: state.rfb?._fbHeight || 0,
+        renderPending: !!state.rfb?._display?.pending?.()};
+}
+function installDisplayMetrics(state) {
+    const display = state.rfb._display;
+    if (typeof display?.flip === 'function') {
+        const original = display.flip;
+        display.flip = function (fromQueue) {
+            const draw = (fromQueue || !this.pending()) && this._damageBounds &&
+                this._damageBounds.right > this._damageBounds.left && this._damageBounds.bottom > this._damageBounds.top;
+            const started = performance.now();
+            try { return original.call(this, fromQueue); }
+            finally { if (draw && active === state) {
+                state.stats.canvasDrawFlips++; state.stats.canvasFlipMilliseconds += Math.max(0, performance.now() - started);
+            }}
+        };
+    }
+    if (typeof display?.flush === 'function') {
+        const original = display.flush;
+        display.flush = function (...args) {
+            const started = performance.now();
+            return original.apply(this, args).then(value => {
+                if (active === state) { state.stats.flushCompletions++;
+                    state.stats.flushWaitMilliseconds += Math.max(0, performance.now() - started); }
+                return value;
+            });
+        };
+    }
+}
+function clearArchives(state) {
+    state.inboundArchive = null; state.outboundArchive = null;
+    if (state.rfb) state.rfb._kyleClipboardArchiveOutgoing = null;
+}
+function requireAppleControl(state) {
+    if (state.rfb.viewOnly || !state.rfb._rfbAppleARD || state.rfb._rfbConnectionState !== 'connected')
+        throw new Error('Rich pasteboard requires a connected Apple Control session');
+}
 function channelFor(state) {
     return {
         readyState: 'connecting', binaryType: 'arraybuffer', protocol: '',
@@ -58,6 +103,10 @@ function channelFor(state) {
             if (this.readyState === 'closed') return;
             this.readyState = 'closed';
             state.outgoing = []; state.incoming = [];
+            clearInterval(state.performanceTimer); state.performanceTimer = null;
+            clearArchives(state);
+            state.lastGenericClipboard = null;
+            if (state.rfb) { state.rfb._ardClipboardOutgoing = null; state.rfb._clipboardText = null; }
             state.queuedBytes = 0; state.incomingBytes = 0;
             state.trustResolve?.(false); state.trustResolve = null;
             post({type: 'close', session: state.id});
@@ -97,6 +146,70 @@ RFB.prototype._negotiateARDAuthAsync = function (...args) {
     return originalDH.apply(this, args);
 };
 
+// These are protocol completion/decode metrics, not estimated frame counts from
+// socket chunks. Partial decoder work contributes time but not completed rects.
+const originalFrameUpdate = RFB.prototype._framebufferUpdate;
+RFB.prototype._framebufferUpdate = function (...args) {
+    const complete = originalFrameUpdate.apply(this, args);
+    if (complete && active?.rfb === this) active.stats.framebufferUpdates++;
+    return complete;
+};
+const originalHandleRect = RFB.prototype._handleRect;
+RFB.prototype._handleRect = function (...args) {
+    const state = active; const encoding = this._FBU?.encoding;
+    const started = performance.now();
+    let complete = false;
+    try { complete = originalHandleRect.apply(this, args); return complete; }
+    finally {
+        if (state && state === active && state.rfb === this) {
+            const elapsed = Math.max(0, performance.now() - started);
+            state.stats.rectangleCalls++; state.stats.decodeMilliseconds += elapsed;
+            const key = String(encoding);
+            if (!(key in state.stats.encodings) && Object.keys(state.stats.encodings).length < 64)
+                state.stats.encodings[key] = {rectangles: 0, milliseconds: 0};
+            const metric = state.stats.encodings[key];
+            if (metric) { metric.milliseconds += elapsed; if (complete) metric.rectangles++; }
+            if (complete) state.stats.rectanglesCompleted++;
+        }
+    }
+};
+
+// Bounded rich archive receive path. Header limits are checked before waiting
+// for the payload or allocating an inflater; archived data never runs as script.
+RFB.prototype._ardHandleServerClipboard = function () {
+    if (this._sock.rQwait('Apple pasteboard header', 15)) return false;
+    try {
+        const headerBytes = new Uint8Array(16); headerBytes[0] = 0x1f;
+        headerBytes.set(this._sock.rQpeekBytes(15), 1);
+        const header = clipboardHeader(headerBytes);
+        if (this._sock.rQwait('Apple pasteboard payload', 15 + header.compressed)) return false;
+        this._sock.rQskipBytes(15);
+        this._ardClipboardSessionId = header.session;
+        const compressed = this._sock.rQshiftBytes(header.compressed);
+        const state = active;
+        if (!state || state.rfb !== this || this.viewOnly) return true;
+        const bytes = decompressArchive(compressed, header.expanded);
+        const transfer = window.crypto.randomUUID();
+        state.inboundArchive = {transfer, bytes};
+        event(state, 'clipboardArchive', {transfer, length: bytes.length});
+        return true;
+    } catch (error) {
+        return this._fail('Invalid Apple pasteboard: ' + String(error.message).slice(0, 256));
+    }
+};
+RFB.prototype.kyleSendPasteboardArchive = function (bytes) {
+    if (this.viewOnly || this._rfbConnectionState !== 'connected') return;
+    const compressed = compressArchive(bytes);
+    RFB.messages.ardClipboardSend(this._sock, 0, this._ardClipboardSessionId, compressed, bytes.length);
+};
+const originalSendClipboard = RFB.prototype._ardSendClipboard;
+RFB.prototype._ardSendClipboard = function (text) {
+    if (this.viewOnly || this._rfbConnectionState !== 'connected') return;
+    // A newer text send supersedes the previously approved rich archive.
+    this._kyleClipboardArchiveOutgoing = null;
+    return originalSendClipboard.call(this, text);
+};
+
 // Browser clipboard APIs are never used; native UI controls all transfers.
 RFB.prototype._writeClipboard = function (text) {
     const state = active;
@@ -124,7 +237,10 @@ const api = {
         const state = {
             id: config.session, identity: config.identity, transportTrusted: config.transportTrusted === true,
             outgoing: [], queuedBytes: 0, incoming: [], incomingBytes: 0, sequence: 0,
-            outstanding: null, rfb: null, channel: null, trustResolve: null, trust: null, lastGenericClipboard: null,
+            outstanding: null, rfb: null, channel: null, trustResolve: null, trust: null, lastGenericClipboard: null, inboundArchive: null, outboundArchive: null,
+            started: performance.now(), performanceTimer: null,
+            stats: {receivedBytes: 0, framebufferUpdates: 0, rectangleCalls: 0, rectanglesCompleted: 0,
+                decodeMilliseconds: 0, encodings: Object.create(null), canvasDrawFlips: 0, canvasFlipMilliseconds: 0, flushCompletions: 0, flushWaitMilliseconds: 0},
         };
         active = state;
         state.channel = channelFor(state);
@@ -134,6 +250,7 @@ const api = {
         state.rfb = new RFB(document.getElementById('desktop'), state.channel, {credentials});
         state.rfb.scaleViewport = true;
         state.rfb.resizeSession = false;
+        installDisplayMetrics(state);
         state.rfb._asyncClipboard.ungrab();
         state.rfb._asyncClipboard = {grab() {}, ungrab() {}, writeClipboard() { return false; }};
         state.rfb.viewOnly = config.viewOnly === true;
@@ -147,10 +264,17 @@ const api = {
         const listen = (name, handler) => state.rfb.addEventListener(name, ev => handler(ev.detail || {}));
         listen('connect', () => {
             event(state, 'connected');
+            clearInterval(state.performanceTimer);
+            state.performanceTimer = setInterval(() => {
+                if (active !== state || state.rfb._rfbConnectionState !== 'connected') {
+                    clearInterval(state.performanceTimer); state.performanceTimer = null; return;
+                }
+                event(state, 'performance', performanceSnapshot(state));
+            }, 1000);
             event(state, 'resize', {width: state.rfb._fbWidth, height: state.rfb._fbHeight});
             event(state, 'capabilities', {apple: !!state.rfb._rfbAppleARD,
                 curtain: !!state.rfb._rfbAppleARD, adaptive: !!state.rfb._rfbAppleARD,
-                textClipboard: true, richClipboard: false});
+                textClipboard: true, richClipboard: !!state.rfb._rfbAppleARD});
         });
         listen('disconnect', detail => event(state, 'disconnected', {reason: detail.clean ? 'Disconnected' : 'Connection closed unexpectedly'}));
         listen('credentialsrequired', detail => event(state, 'credentials', {types: detail.types || []}));
@@ -183,6 +307,7 @@ const api = {
     },
     receive(session, base64) {
         const state = requireSession(session); const bytes = fromBase64(base64);
+        state.stats.receivedBytes += bytes.length;
         if (state.channel.readyState === 'connecting') {
             if (state.incomingBytes + bytes.length > MAX_QUEUE) {
                 fail(state, 'Pre-open receive queue exceeded its limit'); return;
@@ -198,6 +323,8 @@ const api = {
     transportClosed(session, reason = 'Native transport closed') {
         const state = requireSession(session);
         if (state.channel.readyState === 'closed') return;
+        clearInterval(state.performanceTimer); state.performanceTimer = null; clearArchives(state);
+        state.lastGenericClipboard = null; state.rfb._ardClipboardOutgoing = null; state.rfb._clipboardText = null;
         state.channel.readyState = 'closed'; state.trustResolve?.(false);
         state.channel.onclose({code: 1006, reason: String(reason).slice(0, 512)});
     },
@@ -232,7 +359,7 @@ const api = {
         const state = requireSession(session);
         if (operation === 'revoke') {
             state.rfb._ardClipboardOutgoing = null; state.rfb._clipboardText = null;
-            state.lastGenericClipboard = null; return;
+            state.lastGenericClipboard = null; clearArchives(state); return;
         }
         if (state.rfb.viewOnly) return;
         if (operation === 'get') {
@@ -245,6 +372,51 @@ const api = {
             if (typeof text !== 'string' || text.length > 1024 * 1024) throw new Error('Oversized clipboard');
             state.rfb.clipboardPasteFrom(text);
         } else throw new Error('Unknown clipboard operation');
+    },
+    clipboardArchiveRead(session, transfer, offset, length) {
+        const state = requireSession(session); requireAppleControl(state);
+        const archive = state.inboundArchive;
+        if (!archive || archive.transfer !== transfer) throw new Error('Stale pasteboard transfer');
+        if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0 ||
+            length > MAX_CHUNK || offset > archive.bytes.length || length > archive.bytes.length - offset)
+            throw new Error('Invalid pasteboard read range');
+        return bytesToBase64(archive.bytes.subarray(offset, offset + length));
+    },
+    clipboardArchiveRelease(session, transfer) {
+        const state = requireSession(session);
+        if (state.inboundArchive?.transfer === transfer) state.inboundArchive = null;
+    },
+    clipboardArchiveBegin(session, transfer, total) {
+        const state = requireSession(session); requireAppleControl(state);
+        if (typeof transfer !== 'string' || !transfer.length || transfer.length > 128 ||
+            !Number.isInteger(total) || total < 0 || total > ARCHIVE_LIMIT)
+            throw new Error('Invalid pasteboard upload');
+        state.outboundArchive = {transfer, bytes: new Uint8Array(total), offset: 0};
+        // Beginning a new upload revokes older data immediately, even if this
+        // upload later fails or the remote asks for delayed pasteboard content.
+        state.rfb._kyleClipboardArchiveOutgoing = null; state.rfb._ardClipboardOutgoing = null;
+        state.rfb._clipboardText = null;
+    },
+    clipboardArchiveChunk(session, transfer, offset, base64) {
+        const state = requireSession(session); requireAppleControl(state);
+        const archive = state.outboundArchive;
+        if (!archive || archive.transfer !== transfer) throw new Error('Stale pasteboard upload');
+        let bytes;
+        try { bytes = fromBase64(base64); } catch (error) { state.outboundArchive = null; throw error; }
+        if (!Number.isInteger(offset) || offset !== archive.offset || bytes.length > archive.bytes.length - offset) {
+            state.outboundArchive = null; throw new Error('Invalid pasteboard upload order or length');
+        }
+        archive.bytes.set(bytes, offset); archive.offset += bytes.length;
+    },
+    clipboardArchiveCommit(session, transfer) {
+        const state = requireSession(session); requireAppleControl(state);
+        const archive = state.outboundArchive; state.outboundArchive = null;
+        if (!archive || archive.transfer !== transfer || archive.offset !== archive.bytes.length)
+            throw new Error('Incomplete pasteboard upload');
+        validateArchive(archive.bytes);
+        state.rfb.kyleSendPasteboardArchive(archive.bytes);
+        state.rfb._kyleClipboardArchiveOutgoing = archive.bytes;
+        return true;
     },
     curtain(session, active, message = '') {
         const state = requireSession(session); if (state.rfb.viewOnly) return;
@@ -263,7 +435,7 @@ const api = {
     observe(session, enabled) {
         const state = requireSession(session); const rfb = state.rfb;
         if (enabled === true) {
-            rfb._ardClipboardOutgoing = null; rfb._clipboardText = null; state.lastGenericClipboard = null;
+            rfb._ardClipboardOutgoing = null; rfb._clipboardText = null; state.lastGenericClipboard = null; clearArchives(state);
         }
         if (enabled === true && !rfb.viewOnly) {
             // Release DOM hardware keys/buttons before viewOnly starts gating output.
@@ -274,6 +446,7 @@ const api = {
         rfb.viewOnly = enabled === true;
         rfb.ardControlMode = enabled === true ? 0 : 1;
     },
+    performance(session) { return performanceSnapshot(requireSession(session)); },
     quality(session, preset) {
         if (!['adaptive', 'millions', 'thousands', 'gray', 'halftone'].includes(preset)) throw new Error('Invalid quality preset');
         requireSession(session).rfb.ardQualityPreset = preset;

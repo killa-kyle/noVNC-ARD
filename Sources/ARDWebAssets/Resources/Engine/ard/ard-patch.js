@@ -647,7 +647,9 @@ RFB.prototype._ardHandleStateChange = function () {
 
         case statePasteboardDataNeeded:
             // Server needs our clipboard — send it
-            if (this._ardClipboardOutgoing) {
+            if (!this._viewOnly && this._kyleClipboardArchiveOutgoing && this.kyleSendPasteboardArchive) {
+                this.kyleSendPasteboardArchive(this._kyleClipboardArchiveOutgoing);
+            } else if (!this._viewOnly && this._ardClipboardOutgoing) {
                 this._ardSendClipboard(this._ardClipboardOutgoing);
             }
             break;
