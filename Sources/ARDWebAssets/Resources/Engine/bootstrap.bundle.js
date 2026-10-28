@@ -21766,17 +21766,18 @@ var api = {
     if (!Number.isInteger(keysym) || keysym < 0 || keysym > 4294967295) throw new Error("Invalid keysym");
     state.rfb.sendKey(keysym, null, down === true);
   },
-  pointer(session, x, y) {
+  pointer(session, x, y, mask = 0) {
     const rfb = requireSession(session).rfb;
     if (rfb.viewOnly) return;
+    if (!Number.isInteger(mask) || mask < 0 || mask > 127) throw new Error("Invalid pointer mask");
     if (![x, y].every(Number.isFinite) || x < 0 || y < 0 || x >= rfb._fbWidth || y >= rfb._fbHeight)
       throw new Error("Pointer is outside the framebuffer");
     const display = rfb._display;
-    rfb._sendMouse(
-      (x - display._viewportLoc.x) * display.scale,
-      (y - display._viewportLoc.y) * display.scale,
-      0
-    );
+    const localX = (x - display._viewportLoc.x) * display.scale;
+    const localY = (y - display._viewportLoc.y) * display.scale;
+    rfb._mousePos = { x: localX, y: localY };
+    rfb._mouseButtonMask = mask & 7;
+    rfb._sendMouse(localX, localY, mask);
   },
   type(session, text) {
     const state = requireSession(session);
