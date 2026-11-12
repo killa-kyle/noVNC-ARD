@@ -23,3 +23,24 @@ test('resize completion passes evidence only when explicitly provided by picture
     assert.deepEqual(results.at(-1).result,{confirmed:true,width:1200,height:900});
     const count=results.length; hp._resizeDone(); assert.equal(results.length,count);
 });
+test('native live RTP and RTCP share packet cap and release async work',async()=>{
+    const hp=session(); hp.state='streaming'; const finish=[];
+    const decrypt=()=>new Promise(resolve=>finish.push(resolve));
+    hp._ctx={videoIn:{unprotectRtp:decrypt,unprotectRtcp:decrypt}};
+    const rtp=new Uint8Array(13); rtp[0]=1; rtp[1]=0x80; rtp[2]=96;
+    const rtcp=rtp.slice(); rtcp[2]=200;
+    for(let i=0;i<64;i++) hp._onMedia((i%2 ? rtcp : rtp).buffer);
+    assert.equal(hp._nativeDecryptCount,64); assert.equal(hp._nativeDecryptBytes,64*13);
+    hp._onMedia(rtp.buffer); assert.equal(hp.state,'failed');
+    await Promise.resolve(); assert.equal(finish.length,64);
+    finish.forEach(resolve=>resolve(null));
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.equal(hp._nativeDecryptCount,0); assert.equal(hp._nativeDecryptBytes,0);
+});
+test('native live media byte cap rejects before scheduling excess decrypt',()=>{
+    const hp=session(); hp.state='streaming';
+    const release=[]; for(let i=0;i<4;i++) release.push(hp._admitNativeDecrypt(65508));
+    assert.equal(hp._nativeDecryptBytes,262032);
+    assert.equal(hp._admitNativeDecrypt(200),null); assert.equal(hp.state,'failed');
+    release.forEach(fn=>fn()); assert.equal(hp._nativeDecryptBytes,0);
+});

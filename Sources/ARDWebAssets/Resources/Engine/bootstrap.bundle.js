@@ -18924,6 +18924,24 @@ var HpSession = class {
     this._interval(REPORT_MS, () => this._sendReports());
   }
   // ----- media in -----
+  _admitNativeDecrypt(length) {
+    if (!this._nativeMedia) return () => {
+    };
+    const count = this._nativeDecryptCount || 0, bytes = this._nativeDecryptBytes || 0;
+    if (length > 65508 || count >= 64 || bytes + length > 262144) {
+      this._fail("media-overflow", "Native decryption queue exceeded");
+      return null;
+    }
+    this._nativeDecryptCount = count + 1;
+    this._nativeDecryptBytes = bytes + length;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this._nativeDecryptCount--;
+      this._nativeDecryptBytes -= length;
+    };
+  }
   _onMedia(data) {
     if (this.state === "failed" || this.state === "closed") return;
     if (!this._ctx) {
@@ -18945,8 +18963,11 @@ var HpSession = class {
     if (channel !== CHANNEL_AUDIO && channel !== CHANNEL_VIDEO) return;
     const now = this._now();
     const ctx = channel === CHANNEL_VIDEO ? this._ctx.videoIn : this._ctx.audioIn;
+    const release = this._admitNativeDecrypt(bytes.length);
+    if (!release) return;
     if (isRtcp(packet)) {
-      ctx.unprotectRtcp(packet).then((plain) => {
+      const work2 = this._nativeMedia ? Promise.resolve().then(() => ctx.unprotectRtcp(packet)) : ctx.unprotectRtcp(packet);
+      work2.then((plain) => {
         if (!plain) {
           this.stats.authFailures++;
           return;
@@ -18958,11 +18979,12 @@ var HpSession = class {
         }
       }, () => {
         this.stats.authFailures++;
-      });
+      }).finally(release);
       return;
     }
     this._decrypting++;
-    ctx.unprotectRtp(packet).then((rtp) => {
+    const work = this._nativeMedia ? Promise.resolve().then(() => ctx.unprotectRtp(packet)) : ctx.unprotectRtp(packet);
+    work.then((rtp) => {
       this._decrypting--;
       if (!rtp) {
         this.stats.authFailures++;
@@ -18989,7 +19011,7 @@ var HpSession = class {
     }, () => {
       this._decrypting--;
       this.stats.authFailures++;
-    });
+    }).finally(release);
   }
   _onPicture(picture) {
     this.stats.pictures++;

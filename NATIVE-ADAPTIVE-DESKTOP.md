@@ -48,3 +48,13 @@ approval, private-session offer, changing framebuffer dimensions, pointer mappin
 portrait/landscape/fold transitions, restore/disconnect, rejection/failure, Observe,
 SSH rejection, and simultaneous-session isolation on KMac/Duo. No installed-app
 or host mutation has been performed by preparing this candidate.
+
+Live native RTP and RTCP decryption share a 64-packet/256KiB in-flight cap.
+Admission occurs before asynchronous crypto work and accounting is released in
+`finally`, including rejection. Overflow fails the media session closed. Browser
+transport retains its existing policy.
+
+Resize settlement reports confirmed host dimensions only from the HP sink's first
+composited picture callback. Timeout, malformed reoffer, and decoder-error paths
+clear pending status with an explicitly unconfirmed result, never the requested
+size. This separates completion of a resize attempt from evidence it succeeded.
