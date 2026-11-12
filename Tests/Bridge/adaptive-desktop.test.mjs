@@ -30,3 +30,18 @@ test('explicit optional mode injects native socket and resize gates state',async
     assert.throws(()=>api.selectSession('adaptive',1),/private/);
     assert.throws(()=>api.resizeDesktop('old',1000,800),/Stale/);
 });
+test('resize settlement distinguishes decoded host size from timeout or unknown result',async()=>{
+    const {api,instances,messages}=fixture({VideoDecoder:{isConfigSupported:async()=>({supported:true})}});
+    await api.connect(config()); const rfb=instances.at(-1);
+    rfb._ardHp={state:'streaming'}; rfb.ardOnVirtualDisplay=()=>true;
+    const settle=detail=>rfb.listeners.ardhpresize({detail});
+    const status=()=>messages.filter(m=>m.event==='adaptiveDesktop').at(-1).detail;
+    settle({active:false});
+    assert.equal(status().resizePending,false); assert.equal(status().confirmed,false);
+    assert.equal(status().width,undefined); assert.match(status().status,/without a confirmed/);
+    settle({active:false,confirmed:true,width:1234,height:876});
+    assert.equal(status().confirmed,true); assert.equal(status().width,1234);
+    assert.match(status().status,/1234 × 876/);
+    settle({active:false,confirmed:true,width:Infinity,height:876});
+    assert.equal(status().confirmed,false); assert.equal(status().width,undefined);
+});

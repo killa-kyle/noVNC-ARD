@@ -439,8 +439,8 @@ export class HpSession {
     }
 
     // The resize is over, by a new picture or by giving up: clear the dim.
-    _resizeDone() {
-        if (this._resizeSignalled) { this._resizeSignalled = false; this._onResize(false); }
+    _resizeDone(result = {confirmed: false}) {
+        if (this._resizeSignalled) { this._resizeSignalled = false; this._onResize(false, result); }
     }
 
     // The server's answer to a resize re-offer: build the new stream and put
@@ -470,19 +470,21 @@ export class HpSession {
         // screen: a whole first picture painted and composited. A safety
         // timer lifts it even if that first picture never completes.
         let shown = false;
-        const showNew = () => {
+        const showNew = (confirmed = false) => {
             if (shown) return;
             shown = true;
             clearTimeout(showTimer);
             if (oldSink && oldSink !== sink) oldSink.close();
             this._resizeOldSink = null;
-            this._resizeDone();
+            this._resizeDone(confirmed
+                ? {confirmed: true, width: answer.video.width, height: answer.video.height}
+                : {confirmed: false});
         };
         const sink = this._createSink({
             width: answer.video.width,
             height: answer.video.height,
             stripes: answer.video.stripes,
-            onFirstPicture: () => showNew(),
+            onFirstPicture: () => showNew(true),
             onError: reason => { this._log('resize sink error: ' + reason); showNew(); },
         });
         const showTimer = this._timeout(RESIZE_SHOW_MS, () => {

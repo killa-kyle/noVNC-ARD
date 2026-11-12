@@ -18800,10 +18800,10 @@ var HpSession = class {
     this._pendingSecrets = null;
   }
   // The resize is over, by a new picture or by giving up: clear the dim.
-  _resizeDone() {
+  _resizeDone(result = { confirmed: false }) {
     if (this._resizeSignalled) {
       this._resizeSignalled = false;
-      this._onResize(false);
+      this._onResize(false, result);
     }
   }
   // The server's answer to a resize re-offer: build the new stream and put
@@ -18833,19 +18833,19 @@ var HpSession = class {
       onStall: (s) => this._log("resize: waiting for picture " + s.expectedDon)
     });
     let shown = false;
-    const showNew = () => {
+    const showNew = (confirmed = false) => {
       if (shown) return;
       shown = true;
       clearTimeout(showTimer);
       if (oldSink && oldSink !== sink) oldSink.close();
       this._resizeOldSink = null;
-      this._resizeDone();
+      this._resizeDone(confirmed ? { confirmed: true, width: answer.video.width, height: answer.video.height } : { confirmed: false });
     };
     const sink = this._createSink({
       width: answer.video.width,
       height: answer.video.height,
       stripes: answer.video.stripes,
-      onFirstPicture: () => showNew(),
+      onFirstPicture: () => showNew(true),
       onError: (reason) => {
         this._log("resize sink error: " + reason);
         showNew();
@@ -20652,9 +20652,9 @@ RFB.prototype._ardHpStart = function() {
     createAudio: null,
     // KyleVNC package excludes optional HP audio/WASM.
     onState: (state, reason) => this._ardHpOnState(state, reason),
-    onResize: (active2) => {
+    onResize: (active2, result) => {
       this._ardHpResizeVisual(active2);
-      this.dispatchEvent(new CustomEvent("ardhpresize", { detail: { active: active2 } }));
+      this.dispatchEvent(new CustomEvent("ardhpresize", { detail: { active: active2, ...result } }));
     },
     log: (msg) => Info("ARD HP: " + msg),
     warn: (msg) => Warn("ARD HP: " + msg)
@@ -22010,7 +22010,17 @@ var api = {
       else if (available) drainResize(state);
     });
     listen("ardhpresize", (detail) => {
-      if (!detail.active) drainResize(state);
+      if (detail.active || !state.adaptive) return;
+      const streaming = state.rfb._ardHp?.state === "streaming";
+      const confirmed = streaming && detail.confirmed === true && [detail.width, detail.height].every((n) => Number.isInteger(n) && n > 0 && n <= 16384);
+      event(state, "adaptiveDesktop", {
+        status: confirmed ? `Streaming host picture: ${detail.width} × ${detail.height}` : streaming ? "Streaming; resize ended without a confirmed new picture" : "Resize ended; no active video stream",
+        available: streaming && !state.rfb.viewOnly,
+        resizePending: false,
+        confirmed,
+        ...confirmed ? { width: detail.width, height: detail.height } : {}
+      });
+      drainResize(state);
     });
     listen("connect", () => {
       event(state, "connected");

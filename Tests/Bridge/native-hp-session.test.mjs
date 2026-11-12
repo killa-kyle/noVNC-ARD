@@ -13,3 +13,13 @@ test('native HP bounds early encrypted media before keys arrive',()=>{
     for(let i=0;i<65;i++) hp._onMedia(new Uint8Array([1,2]).buffer);
     assert.equal(hp.state,'failed'); assert.equal(hp._early.length,0);
 });
+test('resize completion passes evidence only when explicitly provided by picture callback',()=>{
+    const results=[];
+    const hp=new HpSession({nativeMedia:true,sendOffer(){},createSink(){},onState(){},
+        onResize:(active,result)=>results.push({active,result})});
+    hp._resizeSignalled=true; hp._resizeDone();
+    assert.deepEqual(results.at(-1),{active:false,result:{confirmed:false}});
+    hp._resizeSignalled=true; hp._resizeDone({confirmed:true,width:1200,height:900});
+    assert.deepEqual(results.at(-1).result,{confirmed:true,width:1200,height:900});
+    const count=results.length; hp._resizeDone(); assert.equal(results.length,count);
+});

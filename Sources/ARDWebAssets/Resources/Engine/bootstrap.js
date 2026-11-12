@@ -328,7 +328,21 @@ const api = {
             if (detail.state === 'failed' || detail.state === 'closed') clearResize(state);
             else if (available) drainResize(state);
         });
-        listen('ardhpresize', detail => { if (!detail.active) drainResize(state); });
+        listen('ardhpresize', detail => {
+            if (detail.active || !state.adaptive) return;
+            const streaming = state.rfb._ardHp?.state === 'streaming';
+            const confirmed = streaming && detail.confirmed === true && [detail.width, detail.height]
+                .every(n => Number.isInteger(n) && n > 0 && n <= 16384);
+            event(state, 'adaptiveDesktop', {
+                status: confirmed ? `Streaming host picture: ${detail.width} × ${detail.height}`
+                    : streaming ? 'Streaming; resize ended without a confirmed new picture'
+                        : 'Resize ended; no active video stream',
+                available: streaming && !state.rfb.viewOnly,
+                resizePending: false, confirmed,
+                ...(confirmed ? {width: detail.width, height: detail.height} : {}),
+            });
+            drainResize(state);
+        });
         listen('connect', () => {
             event(state, 'connected');
             clearInterval(state.performanceTimer);

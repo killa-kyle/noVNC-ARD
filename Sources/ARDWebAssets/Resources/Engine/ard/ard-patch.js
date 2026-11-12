@@ -1695,9 +1695,9 @@ RFB.prototype._ardHpStart = function () {
         // Loaded only when wanted: it brings a WebAssembly decoder with it.
         createAudio: null, // KyleVNC package excludes optional HP audio/WASM.
         onState: (state, reason) => this._ardHpOnState(state, reason),
-        onResize: active => {
+        onResize: (active, result) => {
             this._ardHpResizeVisual(active);
-            this.dispatchEvent(new CustomEvent('ardhpresize', {detail: {active}}));
+            this.dispatchEvent(new CustomEvent('ardhpresize', {detail: {active, ...result}}));
         },
         log: msg => Log.Info("ARD HP: " + msg),
         warn: msg => Log.Warn("ARD HP: " + msg),
