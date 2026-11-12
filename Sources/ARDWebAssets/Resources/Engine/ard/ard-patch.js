@@ -1681,6 +1681,8 @@ RFB.prototype._ardHpStart = function () {
     }
     this._ardHp = new HpSession({
         mediaUrl: this._ardHpMediaUrl,
+        WebSocketImpl: this._ardHpNativeSocket,
+        nativeMedia: !!this._ardHpNativeSocket,
         holdOffer,
         feedback: this._ardHpFeedback,
         endpoint: this._ardHpEndpoint,
@@ -1693,7 +1695,10 @@ RFB.prototype._ardHpStart = function () {
         // Loaded only when wanted: it brings a WebAssembly decoder with it.
         createAudio: null, // KyleVNC package excludes optional HP audio/WASM.
         onState: (state, reason) => this._ardHpOnState(state, reason),
-        onResize: active => this._ardHpResizeVisual(active),
+        onResize: active => {
+            this._ardHpResizeVisual(active);
+            this.dispatchEvent(new CustomEvent('ardhpresize', {detail: {active}}));
+        },
         log: msg => Log.Info("ARD HP: " + msg),
         warn: msg => Log.Warn("ARD HP: " + msg),
     });

@@ -103,8 +103,9 @@ export class HpSession {
      * endpoint:        how the viewer describes itself in the offer
      */
     constructor({ mediaUrl, sendOffer, holdOffer, createSink, createAudio, audioMuted, onState,
-                  onResize, feedback, endpoint, WebSocketImpl, now, log, warn }) {
+                  onResize, feedback, endpoint, WebSocketImpl, nativeMedia, now, log, warn }) {
         this._mediaUrl = mediaUrl;
+        this._nativeMedia = nativeMedia === true;
         this._sendOffer = sendOffer;
         this._offerHeld = !!holdOffer;
         this._createSink = createSink;
@@ -327,6 +328,10 @@ export class HpSession {
         // display sent it after, and it was taken for an answer.
         const ports = parseStreamPorts(payload);
         if (ports) {
+            if (this._nativeMedia && (ports.audioPort !== 5900 || ports.videoPort !== 5901)) {
+                this._fail('unsupported-media-ports', 'Native media requires ports 5900/5901');
+                return;
+            }
             this._log('server ports: audio ' + ports.audioPort + ', video ' + ports.videoPort);
             return;
         }
@@ -579,6 +584,11 @@ export class HpSession {
             // The server may start before our keys are ready.
             if (this.state === 'offering') {
                 (this._early = this._early || []).push(data);
+                if (this._nativeMedia && (this._early.length > 64 ||
+                    this._early.reduce((sum, packet) => sum + packet.byteLength, 0) > 262144)) {
+                    this._early = []; this._fail('media-overflow', 'Native early media queue exceeded');
+                    return;
+                }
                 if (this._early.length > 4096) this._early.shift();
             }
             return;

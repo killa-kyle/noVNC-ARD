@@ -30,6 +30,91 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 
+// Sources/ARDWebAssets/Resources/Engine/native-media.js
+function nativeMediaBridge({ session, post: post2, current, encode: encode3, decode: decode3 }) {
+  let socket = null, sequence = 0, outstanding = null, queue = [], bytes = 0;
+  const valid = () => {
+    if (!current()) throw new Error("Stale media session");
+  };
+  const frame = (data) => {
+    const value = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (value.length < 2 || value.length > 65508 || value[0] > 1) throw new Error("Invalid media datagram");
+    return value.slice();
+  };
+  const drain2 = () => {
+    if (socket?.readyState !== 1 || outstanding || !queue.length) return;
+    const data = queue.shift();
+    outstanding = { sequence: ++sequence, length: data.length };
+    post2({ type: "mediaWrite", session, sequence, base64: encode3(data) });
+  };
+  function close(notify = true, reason = "Media closed") {
+    if (!socket || socket.readyState === 3) return;
+    socket.readyState = 3;
+    queue = [];
+    bytes = 0;
+    outstanding = null;
+    if (notify) post2({ type: "mediaClose", session });
+    socket.onclose?.({ code: 1e3, reason: String(reason).slice(0, 256) });
+  }
+  class NativeMediaSocket {
+    constructor(url, protocol) {
+      valid();
+      if (socket || url !== "native-media" || protocol !== "ard-media") throw new Error("Invalid native media channel");
+      this.readyState = 0;
+      this.protocol = "ard-media";
+      this.binaryType = "arraybuffer";
+      socket = this;
+      post2({ type: "mediaOpen", session });
+    }
+    send(data) {
+      valid();
+      if (this.readyState !== 1) throw new Error("Media channel not open");
+      const value = frame(data);
+      if (queue.length + (outstanding ? 1 : 0) >= 64 || bytes + value.length > 262144) {
+        close(true, "Media queue exceeded");
+        throw new Error("Media queue exceeded");
+      }
+      queue.push(value);
+      bytes += value.length;
+      drain2();
+    }
+    close() {
+      close();
+    }
+    get bufferedAmount() {
+      return bytes;
+    }
+  }
+  return {
+    Socket: NativeMediaSocket,
+    opened() {
+      valid();
+      if (socket?.readyState !== 0) throw new Error("Unexpected media open");
+      socket.readyState = 1;
+      socket.onopen?.({});
+      drain2();
+    },
+    receive(base64) {
+      valid();
+      if (socket?.readyState !== 1) throw new Error("Media not open");
+      if (typeof base64 !== "string" || base64.length > 87344) throw new Error("Oversized media frame");
+      socket.onmessage?.({ data: frame(decode3(base64)).buffer });
+    },
+    ack(value) {
+      valid();
+      if (!outstanding || outstanding.sequence !== value) throw new Error("Invalid media acknowledgment");
+      bytes -= outstanding.length;
+      outstanding = null;
+      drain2();
+    },
+    closed(reason) {
+      valid();
+      close(false, reason);
+    },
+    close: () => close()
+  };
+}
+
 // Sources/ARDWebAssets/Resources/Engine/noVNC/core/util/int.js
 /*!
  * noVNC: HTML5 VNC client
@@ -18406,11 +18491,13 @@ var HpSession = class {
     feedback,
     endpoint,
     WebSocketImpl,
+    nativeMedia,
     now,
     log,
     warn
   }) {
     this._mediaUrl = mediaUrl;
+    this._nativeMedia = nativeMedia === true;
     this._sendOffer = sendOffer;
     this._offerHeld = !!holdOffer;
     this._createSink = createSink;
@@ -18623,6 +18710,10 @@ var HpSession = class {
   handleAnswer(payload) {
     const ports = parseStreamPorts(payload);
     if (ports) {
+      if (this._nativeMedia && (ports.audioPort !== 5900 || ports.videoPort !== 5901)) {
+        this._fail("unsupported-media-ports", "Native media requires ports 5900/5901");
+        return;
+      }
       this._log("server ports: audio " + ports.audioPort + ", video " + ports.videoPort);
       return;
     }
@@ -18838,6 +18929,11 @@ var HpSession = class {
     if (!this._ctx) {
       if (this.state === "offering") {
         (this._early = this._early || []).push(data);
+        if (this._nativeMedia && (this._early.length > 64 || this._early.reduce((sum, packet2) => sum + packet2.byteLength, 0) > 262144)) {
+          this._early = [];
+          this._fail("media-overflow", "Native early media queue exceeded");
+          return;
+        }
         if (this._early.length > 4096) this._early.shift();
       }
       return;
@@ -20541,6 +20637,8 @@ RFB.prototype._ardHpStart = function() {
   }
   this._ardHp = new HpSession({
     mediaUrl: this._ardHpMediaUrl,
+    WebSocketImpl: this._ardHpNativeSocket,
+    nativeMedia: !!this._ardHpNativeSocket,
     holdOffer,
     feedback: this._ardHpFeedback,
     endpoint: this._ardHpEndpoint,
@@ -20554,7 +20652,10 @@ RFB.prototype._ardHpStart = function() {
     createAudio: null,
     // KyleVNC package excludes optional HP audio/WASM.
     onState: (state, reason) => this._ardHpOnState(state, reason),
-    onResize: (active2) => this._ardHpResizeVisual(active2),
+    onResize: (active2) => {
+      this._ardHpResizeVisual(active2);
+      this.dispatchEvent(new CustomEvent("ardhpresize", { detail: { active: active2 } }));
+    },
     log: (msg) => Info("ARD HP: " + msg),
     warn: (msg) => Warn("ARD HP: " + msg)
   });
@@ -21500,6 +21601,20 @@ function compressArchive(bytes) {
 var MAX_CHUNK = 65536;
 var MAX_QUEUE = 8 * 1024 * 1024;
 var active = null;
+var connectGeneration = 0;
+var adaptivePrepared = /* @__PURE__ */ new WeakSet();
+function adaptiveDimensions(value) {
+  if (!value || ![value.width, value.height].every((n) => Number.isInteger(n) && n >= 480 && n <= 3840) || value.width * value.height > 8294400 || value.scale !== 1) throw new Error("Invalid adaptive desktop size");
+  return { width: value.width, height: value.height, scale: 1 };
+}
+async function prepareAdaptive(config) {
+  if (config.nativeMedia !== true || config.transportTrusted === true || config.viewOnly === true || config.adaptiveDesktop?.privateSession !== true) throw new Error("Adaptive desktop requires native direct media and private Control session");
+  adaptiveDimensions(config.adaptiveDesktop);
+  if (typeof VideoDecoder === "undefined" || typeof VideoDecoder.isConfigSupported !== "function") throw new Error("HEVC decoder unavailable");
+  const result = await VideoDecoder.isConfigSupported({ codec: "hev1.4.10.H153.BE.08", optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+  if (!result.supported) throw new Error("HEVC decoder unavailable");
+  adaptivePrepared.add(config);
+}
 var post = (body) => window.webkit.messageHandlers.kyleARD.postMessage(body);
 var bytesToBase64 = (bytes) => {
   let text = "";
@@ -21754,11 +21869,58 @@ RFB.prototype._resize = function(width, height) {
   if (active?.rfb === this) event(active, "resize", { width, height });
   return result;
 };
+function clearResize(state) {
+  clearTimeout(state.resizeTimer);
+  clearTimeout(state.resizeExpiry);
+  state.resizeTimer = state.resizeExpiry = null;
+  state.pendingResize = null;
+}
+function drainResize(state) {
+  if (active !== state || !state.pendingResize) return;
+  const rfb = state.rfb;
+  if (rfb.viewOnly) {
+    clearResize(state);
+    return;
+  }
+  if (rfb._rfbConnectionState !== "connected" || rfb._ardHp?.state !== "streaming" || rfb._ardHp.reoffering?.()) return;
+  if (!rfb.ardOnVirtualDisplay()) {
+    clearResize(state);
+    event(state, "adaptiveDesktop", { status: "Unavailable: not a private virtual display", available: false });
+    return;
+  }
+  const wait = 350 - (performance.now() - (state.lastResize ?? -Infinity));
+  if (wait > 0) {
+    clearTimeout(state.resizeTimer);
+    state.resizeTimer = setTimeout(() => drainResize(state), wait);
+    return;
+  }
+  const size = state.pendingResize;
+  if (rfb._ardHpResize(size)) {
+    clearResize(state);
+    state.lastResize = performance.now();
+    event(state, "adaptiveDesktop", {
+      status: "Resolution requested; waiting for host picture",
+      available: true,
+      requestedWidth: size.width,
+      requestedHeight: size.height
+    });
+  }
+}
 var api = {
   connect(config) {
+    if (config?.adaptiveDesktop?.enabled === true && !adaptivePrepared.has(config)) {
+      const generation = ++connectGeneration;
+      return prepareAdaptive(config).then(() => {
+        if (generation !== connectGeneration) throw new Error("Superseded adaptive connection");
+        return api.connect(config);
+      });
+    }
+    ++connectGeneration;
     if (!config || typeof config.session !== "string" || !config.session.length || typeof config.identity !== "string" || !config.identity.length)
       throw new Error("Missing native session or host identity");
     if (active) {
+      clearResize(active);
+      active.media?.close();
       active.rfb.disconnect();
       active.channel.close();
       active = null;
@@ -21798,6 +21960,14 @@ var api = {
       }
     };
     active = state;
+    state.adaptive = config.adaptiveDesktop?.enabled === true && adaptivePrepared.has(config);
+    if (state.adaptive) state.media = nativeMediaBridge({
+      session: state.id,
+      post,
+      current: () => active === state,
+      encode: bytesToBase64,
+      decode: (text) => Uint8Array.from(atob(text), (c2) => c2.charCodeAt(0))
+    });
     state.channel = channelFor(state);
     const credentials = {};
     if (typeof config.username === "string") credentials.username = config.username;
@@ -21818,9 +21988,30 @@ var api = {
     state.rfb._ardAskSessionChoice = true;
     state.rfb._ardVirtualLogin = 1;
     state.rfb._ardEncryptionMode = 2;
-    state.rfb._ardHpAllowed = false;
+    state.rfb._ardHpAllowed = state.adaptive;
+    if (state.adaptive) {
+      state.rfb._ardHpNativeSocket = state.media.Socket;
+      state.rfb._ardHpMediaUrl = "native-media";
+      state.rfb._ardQualityPreset = "highperf";
+      state.rfb._ardHpDisplay = adaptiveDimensions(config.adaptiveDesktop);
+      state.rfb._ardHpVirtualDisplay = true;
+    }
     state.rfb._ardHpAudio = false;
     const listen = (name, handler) => state.rfb.addEventListener(name, (ev) => handler(ev.detail || {}));
+    listen("ardhpstate", (detail) => {
+      const available = state.adaptive && detail.state === "streaming" && state.rfb.ardOnVirtualDisplay();
+      event(state, "adaptiveDesktop", {
+        state: detail.state,
+        reason: detail.reason || null,
+        status: detail.reason ? `Adaptive desktop ${detail.state}: ${detail.reason}` : `Adaptive desktop ${detail.state}`,
+        available
+      });
+      if (detail.state === "failed" || detail.state === "closed") clearResize(state);
+      else if (available) drainResize(state);
+    });
+    listen("ardhpresize", (detail) => {
+      if (!detail.active) drainResize(state);
+    });
     listen("connect", () => {
       event(state, "connected");
       clearInterval(state.performanceTimer);
@@ -21841,7 +22032,11 @@ var api = {
         richClipboard: !!state.rfb._rfbAppleARD
       });
     });
-    listen("disconnect", (detail) => event(state, "disconnected", { reason: detail.clean ? "Disconnected" : "Connection closed unexpectedly" }));
+    listen("disconnect", (detail) => {
+      clearResize(state);
+      state.media?.close();
+      event(state, "disconnected", { reason: detail.clean ? "Disconnected" : "Connection closed unexpectedly" });
+    });
     listen("credentialsrequired", (detail) => event(state, "credentials", { types: detail.types || [] }));
     listen("securityfailure", (detail) => event(state, "error", { reason: detail.reason || "Authentication failed" }));
     listen("ardsessionselect", (detail) => {
@@ -21892,7 +22087,10 @@ var api = {
   },
   transportClosed(session, reason = "Native transport closed") {
     const state = requireSession(session);
+    ++connectGeneration;
     if (state.channel.readyState === "closed") return;
+    clearResize(state);
+    state.media?.close();
     clearInterval(state.performanceTimer);
     state.performanceTimer = null;
     clearArchives(state);
@@ -21915,7 +22113,10 @@ var api = {
     return active === state && state.channel.readyState !== "closed" && state.queuedBytes === 0;
   },
   disconnect(session) {
+    ++connectGeneration;
     const state = requireSession(session);
+    clearResize(state);
+    state.media?.close();
     state.rfb.disconnect();
     state.channel.close();
   },
@@ -22040,6 +22241,7 @@ var api = {
   },
   selectSession(session, command) {
     const state = requireSession(session);
+    if (state.adaptive && command !== 2) throw new Error("Adaptive desktop requires private session");
     if (command !== 1 && command !== 2) throw new Error("Invalid session selection");
     if (command === 1 && !state.allowedSessions?.canShare || command === 2 && !state.allowedSessions?.canPrivate) throw new Error("Session type was not offered by server");
     if (state.rfb._ardSessionSelectStage === "waitingForUI") state.rfb.selectSessionType(command);
@@ -22055,6 +22257,7 @@ var api = {
     const state = requireSession(session);
     const rfb = state.rfb;
     if (enabled === true) {
+      clearResize(state);
       rfb._ardClipboardOutgoing = null;
       rfb._clipboardText = null;
       state.lastGenericClipboard = null;
@@ -22068,10 +22271,42 @@ var api = {
     rfb.viewOnly = enabled === true;
     rfb.ardControlMode = enabled === true ? 0 : 1;
   },
+  mediaOpened(session) {
+    requireSession(session).media?.opened();
+  },
+  mediaReceive(session, base64) {
+    requireSession(session).media?.receive(base64);
+  },
+  mediaAck(session, sequence) {
+    requireSession(session).media?.ack(sequence);
+  },
+  mediaClosed(session, reason) {
+    requireSession(session).media?.closed(reason);
+  },
+  mediaFailed(session, reason) {
+    const state = requireSession(session);
+    state.media?.closed(reason);
+    fail2(state, String(reason).slice(0, 256));
+  },
+  resizeDesktop(session, width, height) {
+    const state = requireSession(session), rfb = state.rfb;
+    const size = adaptiveDimensions({ width, height, scale: 1 });
+    if (!state.adaptive || rfb.viewOnly || ["failed", "closed"].includes(rfb._ardHp?.state)) return false;
+    clearResize(state);
+    state.pendingResize = size;
+    state.resizeExpiry = setTimeout(() => {
+      if (active !== state || !state.pendingResize) return;
+      clearResize(state);
+      event(state, "adaptiveDesktop", { status: "Resize unavailable: host did not become ready", available: false });
+    }, 15e3);
+    drainResize(state);
+    return true;
+  },
   performance(session) {
     return performanceSnapshot(requireSession(session));
   },
   quality(session, preset) {
+    if (requireSession(session).adaptive) throw new Error("Adaptive desktop uses its negotiated video mode");
     if (!["adaptive", "millions", "thousands", "gray", "halftone"].includes(preset)) throw new Error("Invalid quality preset");
     requireSession(session).rfb.ardQualityPreset = preset;
   }

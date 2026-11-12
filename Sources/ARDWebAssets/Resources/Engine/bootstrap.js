@@ -1,4 +1,5 @@
 // Original KyleVNC adapter. Upstream noVNC/ARD code remains in its MPL files.
+import { nativeMediaBridge } from './native-media.js';
 import RFB from './noVNC/core/rfb.js';
 import './ard/ard-patch.js';
 import { ARCHIVE_LIMIT, validateArchive, clipboardHeader, decompressArchive, compressArchive } from './clipboard-codec.js';
@@ -6,6 +7,22 @@ import { ARCHIVE_LIMIT, validateArchive, clipboardHeader, decompressArchive, com
 const MAX_CHUNK = 65536;
 const MAX_QUEUE = 8 * 1024 * 1024;
 let active = null;
+let connectGeneration = 0;
+const adaptivePrepared = new WeakSet();
+function adaptiveDimensions(value) {
+    if (!value || ![value.width, value.height].every(n => Number.isInteger(n) && n >= 480 && n <= 3840)
+        || value.width * value.height > 8294400 || value.scale !== 1) throw new Error('Invalid adaptive desktop size');
+    return {width: value.width, height: value.height, scale: 1};
+}
+async function prepareAdaptive(config) {
+    if (config.nativeMedia !== true || config.transportTrusted === true || config.viewOnly === true
+        || config.adaptiveDesktop?.privateSession !== true) throw new Error('Adaptive desktop requires native direct media and private Control session');
+    adaptiveDimensions(config.adaptiveDesktop);
+    if (typeof VideoDecoder === 'undefined' || typeof VideoDecoder.isConfigSupported !== 'function') throw new Error('HEVC decoder unavailable');
+    const result = await VideoDecoder.isConfigSupported({codec: 'hev1.4.10.H153.BE.08', optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware'});
+    if (!result.supported) throw new Error('HEVC decoder unavailable');
+    adaptivePrepared.add(config);
+}
 const post = body => window.webkit.messageHandlers.kyleARD.postMessage(body);
 const bytesToBase64 = bytes => {
     let text = '';
@@ -227,12 +244,42 @@ RFB.prototype._resize = function (width, height) {
     return result;
 };
 
+function clearResize(state) {
+    clearTimeout(state.resizeTimer); clearTimeout(state.resizeExpiry);
+    state.resizeTimer = state.resizeExpiry = null; state.pendingResize = null;
+}
+function drainResize(state) {
+    if (active !== state || !state.pendingResize) return;
+    const rfb = state.rfb;
+    if (rfb.viewOnly) { clearResize(state); return; }
+    if (rfb._rfbConnectionState !== 'connected' || rfb._ardHp?.state !== 'streaming'
+        || rfb._ardHp.reoffering?.()) return;
+    if (!rfb.ardOnVirtualDisplay()) {
+        clearResize(state); event(state, 'adaptiveDesktop', {status: 'Unavailable: not a private virtual display', available: false}); return;
+    }
+    const wait = 350 - (performance.now() - (state.lastResize ?? -Infinity));
+    if (wait > 0) { clearTimeout(state.resizeTimer); state.resizeTimer = setTimeout(() => drainResize(state), wait); return; }
+    const size = state.pendingResize;
+    if (rfb._ardHpResize(size)) {
+        clearResize(state); state.lastResize = performance.now();
+        event(state, 'adaptiveDesktop', {status: 'Resolution requested; waiting for host picture', available: true,
+            requestedWidth: size.width, requestedHeight: size.height});
+    }
+}
 const api = {
     connect(config) {
+        if (config?.adaptiveDesktop?.enabled === true && !adaptivePrepared.has(config)) {
+            const generation = ++connectGeneration;
+            return prepareAdaptive(config).then(() => {
+                if (generation !== connectGeneration) throw new Error('Superseded adaptive connection');
+                return api.connect(config);
+            });
+        }
+        ++connectGeneration;
         if (!config || typeof config.session !== 'string' || !config.session.length ||
             typeof config.identity !== 'string' || !config.identity.length)
             throw new Error('Missing native session or host identity');
-        if (active) { active.rfb.disconnect(); active.channel.close(); active = null; }
+        if (active) { clearResize(active); active.media?.close(); active.rfb.disconnect(); active.channel.close(); active = null; }
         if (!window.crypto?.subtle || !window.isSecureContext)
             throw new Error('The engine requires WebCrypto in a secure WebKit context');
         const state = {
@@ -244,6 +291,10 @@ const api = {
                 decodeMilliseconds: 0, encodings: Object.create(null), canvasDrawFlips: 0, canvasFlipMilliseconds: 0, flushCompletions: 0, flushWaitMilliseconds: 0},
         };
         active = state;
+        state.adaptive = config.adaptiveDesktop?.enabled === true && adaptivePrepared.has(config);
+        if (state.adaptive) state.media = nativeMediaBridge({session: state.id, post,
+            current: () => active === state, encode: bytesToBase64,
+            decode: text => Uint8Array.from(atob(text), c => c.charCodeAt(0))});
         state.channel = channelFor(state);
         const credentials = {};
         if (typeof config.username === 'string') credentials.username = config.username;
@@ -260,9 +311,24 @@ const api = {
         state.rfb._ardAskSessionChoice = true;
         state.rfb._ardVirtualLogin = 1;
         state.rfb._ardEncryptionMode = 2;
-        state.rfb._ardHpAllowed = false;
+        state.rfb._ardHpAllowed = state.adaptive;
+        if (state.adaptive) {
+            state.rfb._ardHpNativeSocket = state.media.Socket;
+            state.rfb._ardHpMediaUrl = 'native-media';
+            state.rfb._ardQualityPreset = 'highperf';
+            state.rfb._ardHpDisplay = adaptiveDimensions(config.adaptiveDesktop);
+            state.rfb._ardHpVirtualDisplay = true;
+        }
         state.rfb._ardHpAudio = false;
         const listen = (name, handler) => state.rfb.addEventListener(name, ev => handler(ev.detail || {}));
+        listen('ardhpstate', detail => {
+            const available = state.adaptive && detail.state === 'streaming' && state.rfb.ardOnVirtualDisplay();
+            event(state, 'adaptiveDesktop', {state: detail.state, reason: detail.reason || null,
+                status: detail.reason ? `Adaptive desktop ${detail.state}: ${detail.reason}` : `Adaptive desktop ${detail.state}`, available});
+            if (detail.state === 'failed' || detail.state === 'closed') clearResize(state);
+            else if (available) drainResize(state);
+        });
+        listen('ardhpresize', detail => { if (!detail.active) drainResize(state); });
         listen('connect', () => {
             event(state, 'connected');
             clearInterval(state.performanceTimer);
@@ -277,7 +343,7 @@ const api = {
                 curtain: !!state.rfb._rfbAppleARD, adaptive: !!state.rfb._rfbAppleARD,
                 textClipboard: true, richClipboard: !!state.rfb._rfbAppleARD});
         });
-        listen('disconnect', detail => event(state, 'disconnected', {reason: detail.clean ? 'Disconnected' : 'Connection closed unexpectedly'}));
+        listen('disconnect', detail => { clearResize(state); state.media?.close(); event(state, 'disconnected', {reason: detail.clean ? 'Disconnected' : 'Connection closed unexpectedly'}); });
         listen('credentialsrequired', detail => event(state, 'credentials', {types: detail.types || []}));
         listen('securityfailure', detail => event(state, 'error', {reason: detail.reason || 'Authentication failed'}));
         listen('ardsessionselect', detail => {
@@ -322,8 +388,9 @@ const api = {
         state.queuedBytes -= state.outstanding.length; state.outstanding = null; drain(state);
     },
     transportClosed(session, reason = 'Native transport closed') {
-        const state = requireSession(session);
+        const state = requireSession(session); ++connectGeneration;
         if (state.channel.readyState === 'closed') return;
+        clearResize(state); state.media?.close();
         clearInterval(state.performanceTimer); state.performanceTimer = null; clearArchives(state);
         state.lastGenericClipboard = null; state.rfb._ardClipboardOutgoing = null; state.rfb._clipboardText = null;
         state.channel.readyState = 'closed'; state.trustResolve?.(false);
@@ -340,7 +407,7 @@ const api = {
         }
         return active === state && state.channel.readyState !== 'closed' && state.queuedBytes === 0;
     },
-    disconnect(session) { const state = requireSession(session); state.rfb.disconnect(); state.channel.close(); },
+    disconnect(session) { ++connectGeneration; const state = requireSession(session); clearResize(state); state.media?.close(); state.rfb.disconnect(); state.channel.close(); },
     credentials(session, username, password) { requireSession(session).rfb.sendCredentials({username, password}); },
     trust(session, accepted) {
         const state = requireSession(session); state.trustResolve?.(accepted === true); state.trustResolve = null;
@@ -441,6 +508,7 @@ const api = {
     },
     selectSession(session, command) {
         const state = requireSession(session);
+        if (state.adaptive && command !== 2) throw new Error('Adaptive desktop requires private session');
         if (command !== 1 && command !== 2) throw new Error('Invalid session selection');
         if ((command === 1 && !state.allowedSessions?.canShare) ||
             (command === 2 && !state.allowedSessions?.canPrivate)) throw new Error('Session type was not offered by server');
@@ -451,6 +519,7 @@ const api = {
     observe(session, enabled) {
         const state = requireSession(session); const rfb = state.rfb;
         if (enabled === true) {
+            clearResize(state);
             rfb._ardClipboardOutgoing = null; rfb._clipboardText = null; state.lastGenericClipboard = null; clearArchives(state);
         }
         if (enabled === true && !rfb.viewOnly) {
@@ -462,8 +531,26 @@ const api = {
         rfb.viewOnly = enabled === true;
         rfb.ardControlMode = enabled === true ? 0 : 1;
     },
+    mediaOpened(session) { requireSession(session).media?.opened(); },
+    mediaReceive(session, base64) { requireSession(session).media?.receive(base64); },
+    mediaAck(session, sequence) { requireSession(session).media?.ack(sequence); },
+    mediaClosed(session, reason) { requireSession(session).media?.closed(reason); },
+    mediaFailed(session, reason) { const state = requireSession(session); state.media?.closed(reason); fail(state, String(reason).slice(0, 256)); },
+    resizeDesktop(session, width, height) {
+        const state = requireSession(session), rfb = state.rfb;
+        const size = adaptiveDimensions({width, height, scale: 1});
+        if (!state.adaptive || rfb.viewOnly || ['failed', 'closed'].includes(rfb._ardHp?.state)) return false;
+        clearResize(state); state.pendingResize = size;
+        state.resizeExpiry = setTimeout(() => {
+            if (active !== state || !state.pendingResize) return;
+            clearResize(state); event(state, 'adaptiveDesktop', {status: 'Resize unavailable: host did not become ready', available: false});
+        }, 15000);
+        drainResize(state);
+        return true;
+    },
     performance(session) { return performanceSnapshot(requireSession(session)); },
     quality(session, preset) {
+        if (requireSession(session).adaptive) throw new Error('Adaptive desktop uses its negotiated video mode');
         if (!['adaptive', 'millions', 'thousands', 'gray', 'halftone'].includes(preset)) throw new Error('Invalid quality preset');
         requireSession(session).rfb.ardQualityPreset = preset;
     },
