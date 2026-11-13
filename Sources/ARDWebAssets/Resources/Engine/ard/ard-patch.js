@@ -416,6 +416,33 @@ RFB.prototype._ardSendSessionSetup = function () {
     }
 };
 
+// The first picture waits for real dimensions. If the server never answers the
+// display selection with geometry, nothing else asks again, so re-send the
+// selection a bounded number of times. A 0x0 FBUpdateRequest is never sent.
+RFB.prototype._ardScheduleDeferredNudge = function () {
+    this._ardDeferredNudges = this._ardDeferredNudges || 0;
+    clearTimeout(this._ardDeferredNudgeTimer);
+    this._ardDeferredNudgeTimer = setTimeout(() => {
+        if (!this._ardDeferredFBURequest ||
+            this._rfbConnectionState !== 'connected') { return; }
+        if (this._fbWidth > 0 && this._fbHeight > 0) {
+            this._ardDeferredFBURequest = false;
+            Log.Info("ARD: Deferred FBUpdateRequest after nudge wait (" +
+                     this._fbWidth + "x" + this._fbHeight + ")");
+            this._ardRequestFullUpdate(this._fbWidth, this._fbHeight);
+            this._sock.flush();
+            return;
+        }
+        if (this._ardDeferredNudges >= 3) { return; }
+        this._ardDeferredNudges++;
+        Log.Warn("ARD: No geometry yet, re-sending SetDisplay (nudge " +
+                 this._ardDeferredNudges + ")");
+        RFB.messages.ardSetDisplay(this._sock, this._ardSelectedDisplay);
+        this._sock.flush();
+        this._ardScheduleDeferredNudge();
+    }, 2000);
+};
+
 // Normal (non-session-select) path
 RFB.prototype._ardNormalInit = function (width, height) {
     this._ardSendSessionSetup();
@@ -427,6 +454,7 @@ RFB.prototype._ardNormalInit = function (width, height) {
     } else {
         Log.Warn("ARD: Server reported 0x0 dimensions, deferring FBUpdateRequest");
         this._ardDeferredFBURequest = true;
+        this._ardScheduleDeferredNudge();
     }
 
     this._updateConnectionState('connected');

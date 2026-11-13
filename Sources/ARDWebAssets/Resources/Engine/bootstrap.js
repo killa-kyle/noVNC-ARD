@@ -64,7 +64,8 @@ function performanceSnapshot(state) {
         canvasDrawFlips: state.stats.canvasDrawFlips, canvasFlipMilliseconds: state.stats.canvasFlipMilliseconds,
         flushCompletions: state.stats.flushCompletions, flushWaitMilliseconds: state.stats.flushWaitMilliseconds,
         width: state.rfb?._fbWidth || 0, height: state.rfb?._fbHeight || 0,
-        renderPending: !!state.rfb?._display?.pending?.()};
+        renderPending: !!state.rfb?._display?.pending?.(),
+        deferredFBU: !!state.rfb?._ardDeferredFBURequest, displayNudges: state.rfb?._ardDeferredNudges || 0};
 }
 function installDisplayMetrics(state) {
     const display = state.rfb._display;

@@ -19676,6 +19676,30 @@ RFB.prototype._ardSendSessionSetup = function() {
     Info("ARD: Keystroke-only encryption mode — skipping tunnel encryption");
   }
 };
+RFB.prototype._ardScheduleDeferredNudge = function() {
+  this._ardDeferredNudges = this._ardDeferredNudges || 0;
+  clearTimeout(this._ardDeferredNudgeTimer);
+  this._ardDeferredNudgeTimer = setTimeout(() => {
+    if (!this._ardDeferredFBURequest || this._rfbConnectionState !== "connected") {
+      return;
+    }
+    if (this._fbWidth > 0 && this._fbHeight > 0) {
+      this._ardDeferredFBURequest = false;
+      Info("ARD: Deferred FBUpdateRequest after nudge wait (" + this._fbWidth + "x" + this._fbHeight + ")");
+      this._ardRequestFullUpdate(this._fbWidth, this._fbHeight);
+      this._sock.flush();
+      return;
+    }
+    if (this._ardDeferredNudges >= 3) {
+      return;
+    }
+    this._ardDeferredNudges++;
+    Warn("ARD: No geometry yet, re-sending SetDisplay (nudge " + this._ardDeferredNudges + ")");
+    RFB.messages.ardSetDisplay(this._sock, this._ardSelectedDisplay);
+    this._sock.flush();
+    this._ardScheduleDeferredNudge();
+  }, 2e3);
+};
 RFB.prototype._ardNormalInit = function(width, height) {
   this._ardSendSessionSetup();
   if (width > 0 && height > 0) {
@@ -19683,6 +19707,7 @@ RFB.prototype._ardNormalInit = function(width, height) {
   } else {
     Warn("ARD: Server reported 0x0 dimensions, deferring FBUpdateRequest");
     this._ardDeferredFBURequest = true;
+    this._ardScheduleDeferredNudge();
   }
   this._updateConnectionState("connected");
   ardUpdateInfoPanel(this);
@@ -21685,7 +21710,9 @@ function performanceSnapshot(state) {
     flushWaitMilliseconds: state.stats.flushWaitMilliseconds,
     width: state.rfb?._fbWidth || 0,
     height: state.rfb?._fbHeight || 0,
-    renderPending: !!state.rfb?._display?.pending?.()
+    renderPending: !!state.rfb?._display?.pending?.(),
+    deferredFBU: !!state.rfb?._ardDeferredFBURequest,
+    displayNudges: state.rfb?._ardDeferredNudges || 0
   };
 }
 function installDisplayMetrics(state) {
